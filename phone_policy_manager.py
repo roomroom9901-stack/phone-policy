@@ -32,6 +32,7 @@ import urllib.error
 import glob
 import zipfile
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 
 
 # ------------------------------------------------------------
@@ -134,7 +135,8 @@ if __name__ == "__main__" and not FROZEN:
 step(f"시작: python {sys.version.split()[0]} / {sys.executable} / {os.path.abspath(sys.argv[0]) if sys.argv else ''}")
 try:
     from PySide6.QtCore import Qt, QDate, QUrl, QTimer, QThread, Signal, QBuffer, QByteArray, QIODevice
-    from PySide6.QtGui import QColor, QFont, QDesktopServices, QBrush, QImage, QKeySequence, QShortcut, QIcon, QPixmap
+    from PySide6.QtGui import QColor, QFont, QDesktopServices, QBrush, QImage, QKeySequence, QShortcut, QIcon, QPixmap, \
+        QTextDocument, QPainter
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
         QGridLayout, QGroupBox, QLabel, QPushButton, QComboBox, QLineEdit, QSpinBox,
@@ -149,8 +151,9 @@ except Exception as _ex:
 step("PySide6 불러오기 완료")
 
 APP_NAME = "폰정책·정산 매니저"
-APP_VERSION = "2026.09.24.14"     # ← 새 버전을 배포할 때 이 숫자만 올리면 직원 PC에 업데이트 창이 뜹니다
+APP_VERSION = "2026.09.26.3"     # ← 새 버전을 배포할 때 이 숫자만 올리면 직원 PC에 업데이트 창이 뜹니다
 UPDATE_REPO = "roomroom9901-stack/phone-policy"                  # 인터넷 업데이트 저장소 (사장님이 [업데이트 배포] 누르면 자동으로 채워짐)
+DEFAULT_ROLE = "직원"            # 직원용 설치파일·배포본에는 "직원"으로 바뀌어 들어감 (직원 PC는 처음부터 직원 화면)
 SHARE_POLICY_FILE = "정책공유.json"
 SHARE_SALES_PREFIX = "개통_"
 EXE_NAME = "PhonePolicyManager.exe"
@@ -268,6 +271,14 @@ CREATE TABLE IF NOT EXISTS sales(
 CREATE TABLE IF NOT EXISTS expenses(
   id INTEGER PRIMARY KEY AUTOINCREMENT, month TEXT NOT NULL, item TEXT, amount INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS ai_cache(hash TEXT PRIMARY KEY, created TEXT, data TEXT);
+CREATE TABLE IF NOT EXISTS sale_terms(id INTEGER PRIMARY KEY AUTOINCREMENT, sale_id INTEGER, kind TEXT, name TEXT,
+  days INTEGER, due TEXT, done INTEGER DEFAULT 0, done_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_terms_due ON sale_terms(due);
+CREATE TABLE IF NOT EXISTS policy_files(id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, agency_id INTEGER, name TEXT,
+  path TEXT, created TEXT);
+CREATE TABLE IF NOT EXISTS model_meta(model TEXT PRIMARY KEY, qty INTEGER, hidden INTEGER DEFAULT 0, fav INTEGER DEFAULT 0);
+DELETE FROM ai_cache WHERE data LIKE '[[], %';
 CREATE TABLE IF NOT EXISTS rule_sets(
   id INTEGER PRIMARY KEY AUTOINCREMENT, agency_id INTEGER NOT NULL, valid_from TEXT NOT NULL, created_at TEXT);
 CREATE TABLE IF NOT EXISTS rules(
@@ -364,7 +375,7 @@ def norm_join(s, category="무선"):
     s = (s or "").strip().replace(" ", "")
     if not s:
         return ""
-    if s.startswith("신규") or s == "010신규":
+    if s.startswith("신규") or s.startswith("010") or s == "10":
         return "신규"
     if category == "유선":
         if "재약정" in s or "재가입" in s or "갱신" in s:
@@ -374,7 +385,7 @@ def norm_join(s, category="무선"):
         return ""
     if "번호" in s or "번이" in s or "MNP" in s.upper() or "이동" in s:
         return "번호이동"
-    if "기변" in s or "기기" in s or "변경" in s:
+    if "기변" in s or "기기" in s or "변경" in s or "재가입" in s or "재약정" in s:
         return "기기변경"
     return ""
 
@@ -427,7 +438,9 @@ def fmt_cell(v):
     if v is None:
         return ""
     if isinstance(v, float):
-        return str(int(v)) if v.is_integer() else f"{v:g}"
+        if v.is_integer() or abs(v) >= 100_000:
+            return str(int(round(v)))
+        return f"{round(v, 4):.4f}".rstrip("0").rstrip(".")
     if isinstance(v, (datetime.datetime, datetime.date)):
         return v.strftime("%Y-%m-%d")
     return str(v).replace("\r", " ").replace("\n", " ").strip()
@@ -532,6 +545,37 @@ def map_headers(data, aliases, required=0):
 # ============================================================
 # AI 정책 읽기 (Claude API)
 # ============================================================
+DEFAULT_EXCLUDE = "3G, 2G, WCDMA, 선불"
+
+
+def exclude_list(text):
+    return [k.strip() for k in re.split(r"[,/\n]", text or "") if k.strip()]
+
+
+def exclude_prompt(ex):
+    if not ex:
+        return ""
+    return (f"\n[읽지 않을 것 — 매우 중요] 다음 말이 들어간 표·구간·요금제·모델·시트는 통째로 건너뛴다 (block·cols·줄을 만들지 말 것): "
+            f"{', '.join(ex)}\n  예) '3G' 요금제 열, '3G 단말' 구간의 모델들은 전부 무시. 5G·LTE 휴대폰 정책만 읽는다(제외 목록에 없으면).\n")
+
+
+def has_word(text, kw):
+    """'2G'가 '512G' 안에서 걸리지 않도록 앞뒤가 영문·숫자가 아닐 때만 일치"""
+    return re.search(r"(?<![0-9A-Za-z])" + re.escape(kw) + r"(?![0-9A-Za-z])", text or "", re.I) is not None
+
+
+def drop_excluded(rows, ex):
+    """AI가 놓친 것까지 한 번 더 걸러냄 (모델·요금제·그룹에 제외 말이 들어가면 버림)"""
+    if not ex:
+        return rows
+    out = []
+    for r in rows:
+        blob = " ".join(str(x) for x in (r[2], r[3], r[10] if len(r) > 10 else ""))
+        if not any(has_word(blob, k) for k in ex):
+            out.append(r)
+    return out
+
+
 def ai_system(carrier, cat_hint):
     return f"""너는 한국 휴대폰 판매점이 대리점에서 받은 '정책표(단가표)'를 표 데이터로 옮기는 도우미다.
 첨부된 정책표(엑셀 내용, 사진, PDF)를 읽고 판매점이 받는 정책금액을 빠짐없이 추출하라.
@@ -684,26 +728,57 @@ def grid_numeric_count(grid):
     return sum(1 for row in grid for v in row if re.fullmatch(r"-?[\d,]+(\.\d+)?", str(v).strip() or "x"))
 
 
-def grid_text(grid, limit=140_000):
-    """AI에게 보여줄 시트 내용: 'R7: B=SM-S942N256 | C=1254000 | …' (빈칸 생략)"""
-    lines, prev = [], None
-    for r, row in enumerate(grid, 1):
-        cells = []
-        for c, v in enumerate(row, 1):
-            v = str(v).strip()
-            if not v:
-                continue
-            if c > 1 and len(v) > 12 and v == str(row[c - 2]).strip():
-                continue            # 가로 병합으로 반복되는 긴 글 생략
-            cells.append(f"{col_letter(c)}={v[:120]}")
-        if not cells:
-            continue
-        line = " | ".join(cells)
-        if line == prev:
-            continue
+def _is_num(v):
+    return re.fullmatch(r"-?[\d,]+(\.\d+)?", v) is not None
+
+
+def grid_text(grid, limit=140_000, compact=None):
+    """AI에게 보여줄 시트 내용: 'R7: B=SM-S942N256 | C=1254000 | …' (빈칸 생략)
+    큰 시트는 '압축': 숫자 줄이 계속되면 처음 몇 줄만 전체를 보여주고 나머지는 앞 몇 칸(모델 이름)만 → AI가 훨씬 빨리 읽음.
+    (숫자는 어차피 프로그램이 원본 칸에서 직접 읽으므로 AI는 표 구조와 행 범위만 알면 됨)"""
+    def rows_iter():
+        for r, row in enumerate(grid, 1):
+            cells = []
+            for c, v in enumerate(row, 1):
+                v = str(v).strip()
+                if not v:
+                    continue
+                if c > 1 and len(v) > 12 and v == str(row[c - 2]).strip():
+                    continue            # 가로 병합으로 반복되는 긴 글 생략
+                cells.append((c, v))
+            if cells:
+                yield r, cells
+
+    full = []
+    prev = None
+    for r, cells in rows_iter():
+        line = " | ".join(f"{col_letter(c)}={v[:120]}" for c, v in cells)
+        if line != prev:
+            full.append(f"R{r}: {line}")
         prev = line
-        lines.append(f"R{r}: {line}")
-    text = "\n".join(lines)
+    text = "\n".join(full)
+    if compact is None:
+        compact = len(text) > 30_000
+    if not compact:
+        return text[:limit] + ("\n...(너무 길어서 뒷부분 생략)" if len(text) > limit else "")
+    out, run, prev_sig = [], 0, None
+    for r, cells in rows_iter():
+        nums = sum(1 for _, v in cells if _is_num(v))
+        data_row = nums >= 5
+        if not data_row:
+            run = 0
+            out.append(f"R{r}: " + " | ".join(f"{col_letter(c)}={v[:80]}" for c, v in cells))
+            continue
+        sig = tuple(v for _, v in cells[2:])          # 모델코드·이름 빼고 숫자가 앞줄과 똑같으면(색상만 다른 모델 등) 생략
+        if sig == prev_sig:
+            continue
+        prev_sig = sig
+        run += 1
+        if run <= 4:
+            out.append(f"R{r}: " + " | ".join(f"{col_letter(c)}={v[:40]}" for c, v in cells))
+        else:
+            out.append(f"R{r}: " + " | ".join(f"{col_letter(c)}={v[:40]}" for c, v in cells[:4]) + " | …")
+    text = "\n".join(out)
     return text[:limit] + ("\n...(너무 길어서 뒷부분 생략)" if len(text) > limit else "")
 
 
@@ -750,11 +825,20 @@ def ai_spec_system(carrier, cat_hint):
 - model_col: 모델코드 또는 모델명이 있는 열. name_col: 펫네임(한글/영문 이름) 열, 없으면 "". release_col: 출고가 열, 없으면 "".
 - subsidy: 가입유형별 공시지원금(이통사 지원금) 열. 하나뿐이면 세 유형 모두 그 열. 없으면 {{}}.
 - cols: 판매점이 받는 정책 금액(리베이트/단가/정책)이 있는 열마다 하나씩. 공시지원금·출고가 열은 넣지 않는다.
-  plan = 그 열의 요금제 구간 이름 + 월정액(천원)을 대괄호로. 예: "115군 [115,130]", "61/69군 [61,69]", "5GX 프라임 [89]". 모르면 대괄호 생략.
+  plan = 그 열의 요금제 구간 이름 + 대괄호 안에 그 구간에 들어가는 요금제 월정액(천원) 중 '가장 낮은 금액'.
+  예: "115군 [115]", "P_119 베스트109 [109]", "110K 이상 [110]", "61/69군 [61]", "5GX 프라임 [89]". 모르면 대괄호 생략.
   워치·태블릿처럼 요금 구간이 아니라 '단독/번들' 같은 구분이면 plan에 그 이름.
   join = 무선 "신규"/"번호이동"/"기기변경", 유선 "신규"/"전환"/"재약정". 한 열이 여러 유형 공통이면(예: '신규/기변') 같은 col로 유형마다 하나씩 적는다.
   어떤 열의 숫자가 다른 열 금액에 '추가'로 더해지는 구조면 {{"col":"J","plus_col":"N","plan":"번들+추가","join":"번호이동"}} 처럼 plus_col 사용.
-- unit: 정책 금액 숫자의 단위. 45, -9 같은 만원 단위면 10000, 450000 같은 원 단위면 1.
+- unit: 정책 금액 숫자의 단위. 45, -9 같은 만원 단위면 10000, 400·110 같은 천원 단위면 1000, 450000 같은 원 단위면 1.
+  (표 머리글에 '단위: 천원/만원'이 있으면 그대로 따른다. 출고가·공시지원금 단위는 프로그램이 알아서 맞춤)
+- 할인 방식: 공시지원금(지원금약정) 정책과 선택약정 정책이 따로 있으면 둘 다 읽는다.
+  · 열로 나뉘어 있으면 cols 항목에 "discount":"공시" 또는 "discount":"선약"
+  · 행으로 나뉘어 있으면(예: 한 열에 '이통사/선약/공통') 그 열을 block의 "discount_col"로
+  · 구분이 없으면 비워둔다.
+- 공시지원금이 요금 구간마다 다른 열에 있으면 cols 항목에 "subsidy_col":"H" 처럼 그 열을 적는다.
+- 같은 모델이 색상만 다르게 여러 줄(SM-F766N, SM-F766NB, SM-F766NR…)이어도 row 범위에 다 포함하면 된다.
+- '3G 전환', '공통지원금표', '요금제 목록' 같은 참고용 표는 block으로 만들지 않는다.
 - 셀에 '추가 4', '전유형 21'처럼 글자가 섞여 있어도 프로그램이 숫자만 읽으니 그 열을 그대로 지정하면 된다.
 - 벌칙·환수·부당영업 안내 표는 block으로 만들지 않는다.
 
@@ -782,7 +866,38 @@ def parse_json_obj(text):
         return None
 
 
-def apply_spec(grid, spec, carrier, cat_hint):
+TIER_MODES = [("top", "제일 높은 요금 구간만 (빠름)"), ("top2", "높은 구간 2개"), ("all", "모든 구간 (느림)")]
+
+
+def tier_prompt(mode):
+    if mode == "top":
+        return ("\n[요금 구간 — 중요] cols에는 요금 구간 중 '가장 비싼 구간 하나'만 넣는다(신규·번이·기변, 공시·선약). "
+                "나머지 구간 열은 넣지 않는다. 워치·태블릿의 단독/번들 구분은 그대로.\n")
+    if mode == "top2":
+        return "\n[요금 구간 — 중요] cols에는 요금 구간 중 '가장 비싼 구간 2개'만 넣는다. 나머지 구간 열은 넣지 않는다.\n"
+    return ""
+
+
+def limit_tiers(rows, mode):
+    """요금 구간을 위쪽 1~2개만 남김 (요금 숫자가 없는 구분 — 단독/번들 등 — 은 그대로)"""
+    if mode not in ("top", "top2"):
+        return rows
+    keep_n = 1 if mode == "top" else 2
+    levels = {}
+    for r in rows:
+        f = fee_numbers(r[3])
+        if f:
+            levels.setdefault((r[1], r[10] if len(r) > 10 else ""), set()).add(min(f))
+    top = {k: sorted(v, reverse=True)[:keep_n] for k, v in levels.items()}
+    out = []
+    for r in rows:
+        f = fee_numbers(r[3])
+        if not f or min(f) in top.get((r[1], r[10] if len(r) > 10 else ""), []):
+            out.append(r)
+    return out
+
+
+def apply_spec(grid, spec, carrier, cat_hint, tier_mode="all"):
     """AI가 알려준 '읽는 법'대로 원본 셀에서 숫자를 그대로 읽어 정책 줄 생성"""
     def cell(r, letter):
         c = col_index(letter)
@@ -801,13 +916,30 @@ def apply_spec(grid, spec, carrier, cat_hint):
         cat = norm_category(str(b.get("category", ""))) or (cat_hint if cat_hint in CATEGORIES else "무선")
         grp = str(b.get("group", "") or "").strip()
         sub = {norm_join(k, cat) or k: v for k, v in (b.get("subsidy") or {}).items()}
+        disc_col = b.get("discount_col")
+        prev_code, prev_sig = None, None
         for r in range(max(1, r0), min(r1, len(grid)) + 1):
             code = cell(r, b.get("model_col"))
-            if not code or code in ("모델", "모델명", "모델코드", "기종", "펫네임") or first_number(code) == to_num(code) != 0:
+            sig = (cell(r, b.get("release_col")) if b.get("release_col") else "",
+                   cell(r, b.get("discount_col")) if b.get("discount_col") else "") + \
+                tuple(cell(r, c.get("col")) for c in (b.get("cols") or []))
+            if prev_code and code and sig == prev_sig and \
+                    len(os.path.commonprefix([code, prev_code])) >= max(6, len(prev_code) - 3):
+                continue            # 색상만 다른 같은 모델(SM-F766N → SM-F766NB, NR, NSO…)은 한 번만
+            if code:
+                prev_code, prev_sig = code, sig
+            if not code or code in ("모델", "모델명", "모델코드", "기종", "펫네임") or first_number(code) == to_num(code) != 0 \
+                    or len(code) > 60:
                 continue
             name = cell(r, b.get("name_col")) if b.get("name_col") else ""
             model = model_label(code, name, base_names)
             rp = first_number(cell(r, b.get("release_col"))) if b.get("release_col") else None
+            if rp and 0 < rp < 100_000:
+                rp *= 1000                                   # 천원 단위 출고가
+            row_disc = ""
+            if disc_col:
+                t = cell(r, disc_col)
+                row_disc = "선약" if ("선약" in t or "선택" in t) else ("" if ("공통" in t or not t) else "공시")
             for c in b.get("cols", []) or []:
                 x = first_number(cell(r, c.get("col")))
                 if x is None:
@@ -817,11 +949,41 @@ def apply_spec(grid, spec, carrier, cat_hint):
                     if p:
                         x += p
                 join = norm_join(str(c.get("join", "")), cat) or str(c.get("join", "")).strip()
-                sc = sub.get(join)
+                sc = c.get("subsidy_col") or sub.get(join)
                 sv = first_number(cell(r, sc)) if sc else None
-                rows.append([cat, carrier, model, str(c.get("plan", "")).strip(), join, int(rp or 0),
+                if sv and 0 < sv < 20_000:
+                    sv *= 1000                               # 천원 단위 공시지원금
+                disc = str(c.get("discount", "") or "").strip() or row_disc
+                if disc and "선" in disc and row_disc == "공시":
+                    continue                                 # 행과 열의 할인 방식이 안 맞으면 건너뜀
+                if disc and ("공시" in disc or "지원금" in disc) and row_disc == "선약":
+                    continue
+                plan = str(c.get("plan", "")).strip()
+                if "선" in disc and "(선약)" not in plan:
+                    plan += " (선약)"
+                rows.append([cat, carrier, model, plan, join, int(rp or 0),
                              int(sv or 0), int(round(x * unit)), 0, "", grp])
-    return rows
+    return limit_tiers(rows, tier_mode)
+
+
+def is_select_plan(plan):
+    return "(선약)" in (plan or "")
+
+
+def by_discount(cands, mode):
+    """할인 방식에 맞는 정책만: 공시지원 → '(선약)' 아닌 것 / 선택약정 → '(선약)' 우선, 없으면 공통"""
+    if mode == "선약":
+        sel = [p for p in cands if is_select_plan(p["plan"])]
+        return sel or [p for p in cands if not is_select_plan(p["plan"])]
+    return [p for p in cands if not is_select_plan(p["plan"])]
+
+
+def discount_combo():
+    cb = QComboBox()
+    cb.addItem("공시지원금", "공시")
+    cb.addItem("선택약정", "선약")
+    cb.setToolTip("손님이 공시지원금을 받는지, 선택약정(요금 25% 할인)인지 — 대리점 정책이 다를 수 있음")
+    return cb
 
 
 def xlsx_images(path):
@@ -837,6 +999,64 @@ def xlsx_images(path):
     except Exception:
         pass
     return out
+
+
+_SHEET_BAD = ("차감", "환수", "공지", "안내", "재고", "매입", "서식", "양식", "신청서", "가이드", "유의", "패널티",
+              "페널티", "정산", "부당", "개통표", "실적", "목록", "리스트", "사은품표", "주소", "연락처", "변경내역", "이력")
+_SHEET_GOOD = ("모델", "펫네임", "신규", "mnp", "번이", "번호이동", "기변", "기기변경", "요금", "정책", "단가", "리베이트", "출고가")
+
+
+_CURRENT_EXCLUDE = [DEFAULT_EXCLUDE]      # 화면에서 바꾸면 여기에 반영
+
+SHEET_MODES = [("policy", "📊 정책표로 읽기"), ("rules", "📝 부가·차감 조건만 읽기"), ("skip", "🚫 안 읽기")]
+_SKIP_NAMES = ("지원금", "공시", "요금제", "테이블", "계산기", "카드", "전환", "재고", "주소", "연락처", "양식", "서식",
+               "신청서", "실적", "이력", "변경내역", "매입")
+_RULE_NAMES = ("공지", "부가", "추가정책", "적용기준", "페널티", "패널티", "차감", "안내", "유의", "환수", "기준")
+
+
+def grid_char_count(grid):
+    return sum(len(str(v)) for row in grid for v in row if str(v).strip())
+
+
+def classify_sheet(name, grid):
+    """시트 이름·내용으로 기본 읽기 방법 추천: policy(정책표) / rules(조건만) / skip(안 읽음)"""
+    n = name.replace(" ", "")
+    if any(has_word(name, k) for k in exclude_list(_CURRENT_EXCLUDE[0])):
+        return "skip"
+    nums = grid_numeric_count(grid)
+    if any(k in n for k in _SKIP_NAMES) and not any(k in n for k in ("단가", "가격표", "정책표")):
+        return "skip"
+    if any(k in n for k in _RULE_NAMES):
+        return "rules" if grid_char_count(grid) > 150 else "skip"
+    if nums >= 30:
+        return "policy"
+    return "rules" if grid_char_count(grid) > 300 else "skip"
+
+
+def rules_system(carrier):
+    return f"""너는 한국 휴대폰 판매점이 대리점에서 받은 정책 공지·추가정책 문서에서 '부가·차감 조건'만 뽑는 도우미다.
+[이 대리점] 통신사: {carrier or '문서에서 판단'}
+문서에 있는 부가서비스·보험·컬러링·요금제 유지·기변·카드·결합 등의 가감 조건을, 한 줄에 JSON 객체 하나씩만 출력한다(설명 금지):
+  {{"규칙":"짧은 이름","조건":"조건키","해당":금액,"미해당":금액,"그룹":"","모델포함":"","모델제외":"","가입유형":"","요금최소":null,"요금최대":null,"메모":""}}
+- 조건키: 손님 상황에 따라 달라지면 {', '.join(FLAG_KEYS)} 중 하나. 대상이면 항상 적용은 "자동".
+  금액으로 계산 못 하는 벌칙·환수·유지기간·개통 후 일은 "주의"(금액 0, 최대 6개, 메모에 핵심).
+- 해당/미해당: 그 조건에 해당(가입·유치)할 때/안 할 때 정책 금액에 더하거나 빼는 원 단위 금액.
+  예) '미유치 4차감' → 해당 0, 미해당 -40000 / '유치시 4추가' → 해당 40000, 미해당 0 / '미가입시 -2' → 해당 0, 미해당 -20000.
+  금액 숫자가 만원 단위(4, -2 등)면 원으로 바꿔 적는다.
+- 모델제외·가입유형·요금최소/요금최대(월 요금 천원) 조건이 있으면 채운다.
+- 개통 방법·서류·연락처·일반 안내처럼 금액 가감이 아닌 내용은 무시한다."""
+
+
+def sheet_score(name, grid):
+    """정책표일 가능성 점수 (높을수록 정책표). 음수면 기본으로 빼둠"""
+    nums = grid_numeric_count(grid)
+    head = " ".join(str(v) for row in grid[:40] for v in row if str(v).strip()).lower()
+    good = sum(1 for k in _SHEET_GOOD if k in head)
+    bad = any(k in name for k in _SHEET_BAD) or any(has_word(name, k) for k in exclude_list(_CURRENT_EXCLUDE[0]))
+    score = min(nums, 400) / 40 + good * 2 - (8 if bad else 0)
+    if nums < 20:
+        score -= 10
+    return score
 
 
 def load_source(path):
@@ -984,6 +1204,8 @@ def api_request(key, model, system, content, max_tokens=32000, stream=True, on_e
     if prov == "openai":
         body = {"model": model, "max_completion_tokens": max(max_tokens, 2000),
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": _to_openai(content)}]}
+        if model.startswith(("gpt-5", "o1", "o3", "o4")):
+            body["reasoning_effort"] = "low"          # 생각은 짧게 → 훨씬 빠름
         d = _post_json("https://api.openai.com/v1/chat/completions", body, {"Authorization": f"Bearer {key}"}, long_to)
         ch = (d.get("choices") or [{}])[0]
         text = (ch.get("message") or {}).get("content") or ""
@@ -991,6 +1213,8 @@ def api_request(key, model, system, content, max_tokens=32000, stream=True, on_e
     body = {"system_instruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": _to_gemini(content)}],
             "generationConfig": {"maxOutputTokens": max(max_tokens, 2000)}}
+    if "2.5" in model:
+        body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 1024}   # 생각은 짧게 → 빠름
     d = _post_json(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                    body, {"x-goog-api-key": key}, long_to)
     cand = (d.get("candidates") or [{}])[0]
@@ -1095,13 +1319,16 @@ def save_ai_log(name, text):
 
 class AIWorker(QThread):
     progress = Signal(str)
-    done = Signal(list, list, list, bool)
+    done = Signal(object, object, object, bool)
     failed = Signal(str)
 
     def __init__(self, key, model, sources, carrier, cat_hint):
         super().__init__()
         self.key, self.model, self.sources = key, model, sources
         self.carrier, self.cat_hint = carrier, cat_hint
+        self.exclude = []
+        self.tier_mode = "top"
+        self.diag = []
         self._stop = False
 
     def cancel(self):
@@ -1117,73 +1344,537 @@ class AIWorker(QThread):
                 self.progress.emit(f"🤖 {tag} — 받아 적는 중… {k}줄")
             elif kind == "waiting":
                 self.progress.emit(f"🤖 {tag} — 연결됨. AI가 읽는 중… (다 읽으면 한 번에 도착합니다)")
-        text, stop = api_request(self.key, self.model, system, content, max_tokens=max_tokens,
-                                 on_event=ev, should_stop=lambda: self._stop)
+        import time
+        for attempt in range(4):         # 동시에 여러 개 보내다 '잠깐 쉬어라(429)'가 오면 기다렸다 다시
+            try:
+                text, stop = api_request(self.key, self.model, system, content, max_tokens=max_tokens,
+                                         on_event=ev, should_stop=lambda: self._stop)
+                break
+            except urllib.error.HTTPError as ex:
+                if ex.code not in (429, 500, 503, 529) or attempt == 3 or self._stop:
+                    raise
+                self.progress.emit(f"⏳ {tag} — AI 서버가 바빠서 {15 * (attempt + 1)}초 뒤 다시 시도…")
+                time.sleep(15 * (attempt + 1))
         save_ai_log(tag, text)
         return text, stop
 
-    def _transcribe(self, src, tag):
+    def _transcribe(self, src, tag, car=None):
         """사진·PDF·카톡 글·구조 분석 실패한 표: AI가 직접 옮겨 적기"""
-        text, stop = self._call(ai_system(self.carrier, self.cat_hint), build_content(src), tag)
+        car = car or self.carrier
+        text, stop = self._call(ai_system(car, self.cat_hint) + exclude_prompt(self.exclude) + tier_prompt(self.tier_mode),
+                                build_content(src), tag)
         r, nt = parse_ai_lines(text)
         rows, rules = [], []
         for x in r:
             if isinstance(x, dict):
                 rules.append(norm_rule(x))
             else:
-                rows += expand_ai_row(x, self.carrier, self.cat_hint)
-        return rows, rules, nt, stop == "max_tokens"
+                rows += expand_ai_row(x, car, self.cat_hint)
+        return limit_tiers(rows, self.tier_mode), rules, nt, stop == "max_tokens"
+
+    def _canon(self, row_lists):
+        """여러 대리점 정책표의 모델 이름을 같은 기종끼리 같은 이름으로 (SK·KT·LG 비교가 되도록)"""
+        names = sorted({r[2] for rows in row_lists for r in rows if r and r[2]})
+        if not names:
+            return
+        self.progress.emit(f"🔤 모델 이름 {len(names)}개를 통신사끼리 맞추는 중…")
+        mapping = {}
+        existing = list(getattr(self, "existing_models", []))[:400]
+        for i in range(0, len(names), 250):
+            chunk = names[i:i + 250]
+            content = [{"type": "text", "text": "[기존 표준 이름 목록]\n" + "\n".join(existing) +
+                        "\n\n[정리할 모델 이름]\n" + "\n".join(chunk)}]
+            try:
+                text, _ = self._call(CANON_SYSTEM, content, "모델이름", 16000)
+                d = parse_json_obj(text) or {}
+                for k, v in d.items():
+                    if isinstance(v, str) and v.strip():
+                        mapping[k] = [v.strip()]
+                    elif isinstance(v, list):
+                        vs = [str(x).strip() for x in v if str(x).strip()]
+                        if vs:
+                            mapping[k] = vs
+            except Cancelled:
+                raise
+            except Exception:
+                pass
+        for rows in row_lists:
+            new = []
+            for r in rows:
+                if r and r[2] in mapping:
+                    for nm in mapping[r[2]]:
+                        x = list(r)
+                        x[2] = nm
+                        new.append(x)
+                else:
+                    new.append(r)
+            rows[:] = new
+
+    def _sheet_task(self, src, sn, grid, tag, car=None):
+        car = car or self.carrier
+        stag = f"{tag} [{sn}]"
+        content = [{"type": "text", "text": f"[시트: {sn}]\n{grid_text(grid)}\n\n위 시트의 읽는 법(JSON)을 만들어줘."}]
+        text, _ = self._call(ai_spec_system(car, self.cat_hint) + exclude_prompt(self.exclude) + tier_prompt(self.tier_mode),
+                             content, stag, 16000)
+        spec = parse_json_obj(text) or {}
+        got = apply_spec(grid, spec, car, self.cat_hint, self.tier_mode)
+        if not spec:
+            self.diag.append(f"{stag}: AI 응답 해석 실패 — {text.strip()[:150] or '(빈 응답)'}")
+        elif len(got) < 3:
+            self.diag.append(f"{stag}: 표 구조 응답은 왔는데 금액을 못 찾음 (구역 {len(spec.get('blocks') or [])}개)")
+        if len(got) >= 3:
+            return (got, [norm_rule(x) for x in (spec.get("rules") or []) if isinstance(x, dict)],
+                    [f"[{sn}] {x}" for x in (spec.get("notes") or [])], False, len(got))
+        # 구조 분석이 안 되는 특이한 표 → AI가 직접 옮겨 적기
+        self.progress.emit(f"🤖 {stag} — 특이한 표라서 AI가 직접 옮겨 적는 중…")
+        r, ru, nt, tr = self._transcribe(dict(name=f"{src['name']} [{sn}]", kind="sheet", data=[(sn, grid)]), stag, car)
+        return r, ru, nt, tr, 0
+
+    def _rules_task(self, src, sn, grid, tag, car=None):
+        car = car or self.carrier
+        lines = [" | ".join(str(v).strip() for v in row if str(v).strip()) for row in grid]
+        text = "\n".join(l for l in lines if l)[:15000]
+        t, _ = self._call(rules_system(car), [{"type": "text", "text": f"[{sn}]\n{text}"}], f"{tag} [{sn}] 조건", 16000)
+        r, nt = parse_ai_lines(t)
+        return [], [norm_rule(x) for x in r if isinstance(x, dict)], [], False, 0
+
+    def _other_task(self, src, tag, car=None):
+        r, ru, nt, tr = self._transcribe(src, tag, car)
+        return r, ru, [f"[{src['name']}] {x}" for x in nt], tr, 0
 
     def run(self):
         try:
-            rows, rules, notes, truncated = [], [], [], False
-            self.exact = 0
+            tasks = []
             n = len(self.sources)
             for i, src in enumerate(self.sources, 1):
                 tag = f"({i}/{n}) {src['name']}"
-                self.progress.emit(f"🤖 {tag} — AI 서버에 연결하는 중…")
                 if src["kind"] == "sheet":
                     for sn, grid in src["data"]:
-                        if grid_numeric_count(grid) < 5:
-                            continue
-                        stag = f"{tag} [{sn}]"
-                        content = [{"type": "text", "text": f"[시트: {sn}]\n{grid_text(grid)}\n\n위 시트의 읽는 법(JSON)을 만들어줘."}]
-                        text, _ = self._call(ai_spec_system(self.carrier, self.cat_hint), content, stag, 16000)
-                        spec = parse_json_obj(text) or {}
-                        got = apply_spec(grid, spec, self.carrier, self.cat_hint)
-                        if len(got) >= 3:
-                            self.progress.emit(f"📐 {stag} — 원본 셀에서 숫자 {len(got)}개 정확히 읽음")
-                            rows += got
-                            self.exact += len(got)
-                            rules += [norm_rule(x) for x in (spec.get("rules") or []) if isinstance(x, dict)]
-                            notes += [f"[{sn}] {x}" for x in (spec.get("notes") or [])]
-                        else:       # 구조 분석이 안 되는 특이한 표 → AI가 직접 옮겨 적기
-                            self.progress.emit(f"🤖 {stag} — 특이한 표라서 AI가 직접 옮겨 적는 중…")
-                            r, ru, nt, tr = self._transcribe(dict(name=f"{src['name']} [{sn}]", kind="sheet",
-                                                                  data=[(sn, grid)]), stag)
-                            rows += r
-                            rules += ru
-                            notes += nt
-                            truncated |= tr
+                        if grid_numeric_count(grid) >= 5:
+                            tasks.append((self._sheet_task, (src, sn, grid, tag)))
+                    for sn, grid in src.get("rule_sheets", []):
+                        tasks.append((self._rules_task, (src, sn, grid, tag)))
                     for iname, parts in src.get("images", []):
-                        r, ru, nt, tr = self._transcribe(dict(name=f"{src['name']} 속 사진 {iname}", kind="image",
-                                                              data=parts), f"{tag} 사진")
-                        rows += r
-                        rules += ru
-                        notes += nt
-                        truncated |= tr
+                        tasks.append((self._other_task, (dict(name=f"{src['name']} 속 사진 {iname}", kind="image",
+                                                               data=parts), f"{tag} 사진")))
                 else:
-                    r, ru, nt, tr = self._transcribe(src, tag)
-                    rows += r
-                    rules += ru
-                    notes += [f"[{src['name']}] {x}" for x in nt]
-                    truncated |= tr
+                    tasks.append((self._other_task, (src, tag)))
+            if not tasks:
+                self.done.emit([], [], [], False)
+                return
+            self.progress.emit(f"🤖 AI 서버에 연결하는 중… (시트·사진 {len(tasks)}개를 동시에 읽습니다)")
+            results = [None] * len(tasks)
+            done_n = [0]
+
+            def run_one(i):
+                fn, args = tasks[i]
+                results[i] = fn(*args)
+                done_n[0] += 1
+                self.progress.emit(f"📐 {done_n[0]}/{len(tasks)}개 다 읽음…")
+
+            with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as ex:
+                futs = [ex.submit(run_one, i) for i in range(len(tasks))]
+                for f in futs:
+                    f.result()          # 오류가 있으면 여기서 올라옴
+            results = [(drop_excluded(r[0], self.exclude),) + tuple(r[1:]) for r in results]
+            self._canon([r[0] for r in results])
+            rows, rules, notes, truncated = [], [], [], False
+            self.exact = 0
+            for r, ru, nt, tr, ex_n in results:
+                rows += r
+                rules += ru
+                notes += nt
+                truncated |= tr
+                self.exact += ex_n
             self.done.emit(rows, rules, notes, truncated)
         except Cancelled:
             pass
         except Exception as ex:
             save_ai_log("오류", repr(ex))
             self.failed.emit(friendly_error(ex))
+
+
+CANON_SYSTEM = """너는 한국 휴대폰 모델명 정리 도우미다. 아래 모델 이름들은 SK·KT·LG 여러 대리점 정책표에서 모은 것이라
+같은 기종이 서로 다르게 적혀 있다. 같은 기종·같은 용량이면 반드시 같은 '표준 이름'이 되게 바꿔라.
+- 표준 이름 형식: 브랜드 + 모델 + 용량. 예) "갤럭시 S26 256GB", "갤럭시 S26 울트라 512GB", "갤럭시 Z 플립7 256GB",
+  "아이폰 17 Pro Max 256GB", "아이폰 17 256GB", "갤럭시 A17", "갤럭시 워치8 44mm", "스타일폴더2"
+- 모델코드만 있으면(SM-S942N256, UIP17PM-256, AT-M140L 등) 코드로 기종을 알아내서 이름으로 바꾼다.
+- 통신사 전용 표시(모델코드 끝 K/L/S 등)나 색상은 빼고, 용량은 살린다.
+  용량이 안 적힌 기본 모델은 그 기종의 기본(가장 작은) 용량을 붙인다. 예) "갤럭시 Z 폴드7" → "갤럭시 Z 폴드7 256GB",
+  "아이폰 17 Pro" → "아이폰 17 Pro 256GB". 용량이 없는 기종(워치·키즈폰·폴더폰 등)은 붙이지 않는다.
+- [기존 표준 이름 목록]에 같은 기종·용량이 있으면 반드시 그 이름을 그대로 쓴다.
+- 확실하지 않으면 원래 이름을 최대한 살린다. 서로 다른 기종을 같은 이름으로 합치지 말 것.
+- 한 이름에 여러 기종·용량이 함께 적혀 있으면(예: "S26 일반 256/512 S26 울트라 256/512", "SM-S942(8)NK 갤럭시 S26(Ultra)",
+  "AIP17(P,PM) iPhone 17 (Pro,Max)") 해당하는 표준 이름을 모두 배열로 준다.
+  예) "S26 일반 256/512" → ["갤럭시 S26 256GB","갤럭시 S26 512GB"]
+출력: 설명 없이 JSON 객체 하나 {"원래 이름": "표준 이름" 또는 ["표준 이름", …], ...} — [정리할 모델 이름]을 모두 포함."""
+
+
+class BatchWorker(AIWorker):
+    """여러 대리점 파일을 한꺼번에: 전부 동시에 읽고, 모델 이름을 통신사끼리 맞춘 뒤 파일별 결과로 돌려줌"""
+    batch_done = Signal(object)      # dict(int→결과)는 Qt 신호로 넘기면 키가 망가져서 object로 그대로 전달
+
+    def __init__(self, key, model, items, cached, existing_models):
+        super().__init__(key, model, [], "", "자동 판단")
+        self.items = items              # [(idx, src, carrier)]
+        self.cached = cached            # {idx: (rows, rules, notes, trunc, exact)}
+        self.existing_models = existing_models
+
+    def run(self):
+        try:
+            tasks = []
+            for idx, src, car in self.items:
+                tag = src["name"]
+                if src["kind"] == "sheet":
+                    for sn, grid in src["data"]:
+                        if grid_numeric_count(grid) >= 5:
+                            tasks.append((idx, self._sheet_task, (src, sn, grid, tag, car)))
+                    for sn, grid in src.get("rule_sheets", []):
+                        tasks.append((idx, self._rules_task, (src, sn, grid, tag, car)))
+                    for iname, parts in src.get("images", []):
+                        tasks.append((idx, self._other_task, (dict(name=f"{tag} 속 사진 {iname}", kind="image",
+                                                                    data=parts), f"{tag} 사진", car)))
+                else:
+                    tasks.append((idx, self._other_task, (src, tag, car)))
+            results = [None] * len(tasks)
+            cnt = [0]
+            if tasks:
+                self.progress.emit(f"🤖 AI가 {len(tasks)}개 시트·사진을 동시에 읽는 중…")
+
+                def run_one(i):
+                    _, fn, args = tasks[i]
+                    results[i] = fn(*args)
+                    cnt[0] += 1
+                    self.progress.emit(f"📐 {cnt[0]}/{len(tasks)}개 다 읽음…")
+
+                with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as ex:
+                    for f in [ex.submit(run_one, i) for i in range(len(tasks))]:
+                        f.result()
+            per = {k: [list(v[0]), list(v[1]), list(v[2]), v[3], v[4]] for k, v in self.cached.items()}
+            for (idx, _, _), res in zip(tasks, results):
+                p = per.setdefault(idx, [[], [], [], False, 0])
+                p[0] += res[0]
+                p[1] += res[1]
+                p[2] += res[2]
+                p[3] = p[3] or res[3]
+                p[4] += res[4]
+            for idx, src_, _ in self.items:
+                if not per.get(idx, [[]])[0]:
+                    mine = [d for d in self.diag if d.startswith(src_["name"])]
+                    per.setdefault(idx, [[], [], [], False, 0])[2].extend(mine or ["AI가 이 파일에서 정책 금액을 못 찾음"])
+            for p in per.values():
+                p[0] = drop_excluded(p[0], self.exclude)
+            self._canon([p[0] for p in per.values()])
+            self.batch_done.emit(per)
+        except Cancelled:
+            pass
+        except Exception as ex:
+            save_ai_log("오류", repr(ex))
+            self.failed.emit(friendly_error(ex))
+
+
+def save_policy_set(db, aid, vf, rows, rules=None, end_missing=True):
+    """정책 줄들 + 규칙을 한 대리점에 저장 → (신규·변경, 동일, 종료, 문제줄수)"""
+    items, bad = {}, 0
+    for v in rows:
+        v = [("" if x is None else str(x)) for x in (list(v) + [""] * 11)[:11]]
+        cat = norm_category(v[0]) or "무선"
+        car = norm_carrier(v[1]) or v[1].strip()
+        model, plan = v[2].strip(), v[3].strip()
+        join = norm_join(v[4], cat) or (v[4].strip() if cat == "유선" else "")
+        if not (car and model and join):
+            bad += 1
+            continue
+        items[(cat, car, model, plan, join)] = dict(release_price=to_int(v[5]), public_subsidy=to_int(v[6]),
+                                                    rebate=to_int(v[7]), deduction=to_int(v[8]),
+                                                    conditions=v[9].strip(), grp=v[10].strip())
+    ins = same = ended = 0
+    for k, d in items.items():
+        cur = db.find_policy(vf, aid, *k)
+        if cur and all(cur[f] == d[f] for f in MONEY_FIELDS) and (cur["conditions"] or "") == d["conditions"] \
+                and (cur["grp"] or "") == d["grp"]:
+            same += 1
+            continue
+        db.x("INSERT INTO policies(agency_id,category,carrier,model,plan,join_type,release_price,public_subsidy,"
+             "rebate,deduction,conditions,grp,valid_from,deleted,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)",
+             (aid, *k, d["release_price"], d["public_subsidy"], d["rebate"], d["deduction"], d["conditions"],
+              d["grp"], vf, now()), commit=False)
+        ins += 1
+    if end_missing and items:
+        cats = {k[0] for k in items}
+        for p in db.effective_policies(vf, aid):
+            k = (p["category"], p["carrier"], p["model"], p["plan"], p["join_type"])
+            if k not in items and k[0] in cats:
+                db.x("INSERT INTO policies(agency_id,category,carrier,model,plan,join_type,valid_from,deleted,"
+                     "created_at) VALUES(?,?,?,?,?,?,?,1,?)", (aid, *k, vf, now()), commit=False)
+                ended += 1
+    db.commit()
+    if rules:
+        db.save_rules(aid, vf, rules)
+    db.unify_models()
+    return ins, same, ended, bad
+
+
+# ============================================================
+# 최신 모델 먼저 · 정책 변동 · 이미지 만들기
+# ============================================================
+_CAP_TOKEN = re.compile(r"(?<![0-9])(\d{2,4})\s?(GB|TB|G|T)(?![A-Za-z])", re.I)
+
+
+def _cap_value(name):
+    m = _CAP_TOKEN.search(name or "")
+    if not m:
+        return None
+    v = int(m.group(1))
+    return v * 1024 if m.group(2).upper().startswith("T") else v
+
+
+def unify_capacity_names(names):
+    """'갤럭시 Z 폴드7' 처럼 용량 없는 이름을, 같은 모델의 가장 작은 용량 이름('… 256GB')으로 합치기"""
+    names = set(n for n in names if n)
+    with_cap = {}
+    for n in names:
+        v = _cap_value(n)
+        if v:
+            base = _CAP_TOKEN.sub("", n).strip()
+            base = re.sub(r"\s+", " ", base)
+            with_cap.setdefault(base, []).append((v, n))
+    mp = {}
+    for n in names:
+        if _cap_value(n) is None:
+            b = re.sub(r"\s+", " ", n).strip()
+            if b in with_cap:
+                mp[n] = min(with_cap[b])[1]
+    return mp
+
+
+def model_year(name):
+    """모델 이름으로 출시 연도 추정 (최신 모델을 위로 올리기 위해)"""
+    n = (name or "").lower()
+    for x, y in (("갤럭시", " "), ("galaxy", " "), ("아이폰", "iphone "), ("플립", "flip"), ("폴드", "fold"),
+                 ("워치", "watch"), ("탭", "tab "), ("울트라", " ultra"), ("플러스", "+")):
+        n = n.replace(x, y)
+    for pat, base, fam in ((r"tab\s*s?\s*(\d{1,2})(?!\d)", 2014, 2),                  # 탭 S10 → 2024
+                           (r"watch\s*(\d{1,2})(?!\d)", 2017, 2),                       # 워치8 → 2025
+                           (r"(?:flip|fold)\s*(\d)(?!\d)", 2018, 0),                    # 플립7 → 2025
+                           (r"iphone\s*(\d{2})(?!\d)", 2008, 0),                        # 아이폰17 → 2025
+                           (r"(?<![a-z0-9])s\s?(\d{2})(?!\d)", 2000, 0),                # 갤럭시 S26 → 2026
+                           (r"(?<![a-z0-9])a\s?(\d{2})(?!\d)", 2019, 1)):               # 갤럭시 A36·A16 → 2025 (끝자리)
+        m = re.search(pat, n)
+        if m:
+            v = int(m.group(1))
+            return (base + v % 10 if fam == 1 else base + v), fam
+    return 0, 3
+
+
+def model_sort_key(name, release=0):
+    y, fam = model_year(name)
+    return (-y, fam, -(release or 0), name)
+
+
+def policy_changes(db, aid, vf):
+    """이번에 저장한 정책이 직전 정책보다 오른/내린 것 → (오른 것, 내린 것, 새 모델 수)"""
+    rows = db.q("""SELECT p.model, p.plan, p.join_type, p.rebate - p.deduction AS cur,
+        (SELECT q.rebate - q.deduction FROM policies q WHERE q.agency_id=p.agency_id AND q.category=p.category
+           AND q.carrier=p.carrier AND q.model=p.model AND q.plan=p.plan AND q.join_type=p.join_type
+           AND q.valid_from<p.valid_from AND q.deleted=0 ORDER BY q.valid_from DESC, q.id DESC LIMIT 1) AS prev
+        FROM policies p WHERE p.agency_id=? AND p.valid_from=? AND p.deleted=0""", (aid, vf))
+    ups, downs, new = [], [], 0
+    hidden = {m for m, r in db.model_meta().items() if r["hidden"]}
+    for r in rows:
+        if r["model"] in hidden:
+            continue
+        if r["prev"] is None:
+            new += 1
+        elif r["cur"] != r["prev"]:
+            (ups if r["cur"] > r["prev"] else downs).append(
+                (r["model"], re.sub(r"\s*\[.*?\]", "", r["plan"]), r["join_type"], r["prev"], r["cur"]))
+    ups.sort(key=lambda x: -(x[4] - x[3]))
+    downs.sort(key=lambda x: x[4] - x[3])
+    return ups, downs, new
+
+
+def change_text(ups, downs, n=5):
+    short = {"신규": "신규", "번호이동": "번이", "기기변경": "기변"}
+    f = lambda x: f"{x[0]} {short.get(x[2], x[2])} {x[3] / 10000:g}→{x[4] / 10000:g}만"
+    return (("📈 " + ", ".join(f(x) for x in ups[:n])) if ups else "") + \
+           ("   " if ups and downs else "") + (("📉 " + ", ".join(f(x) for x in downs[:n])) if downs else "")
+
+
+def html_to_png(html_text, width, path):
+    """HTML 표를 카톡에 올릴 이미지로"""
+    doc = QTextDocument()
+    doc.setDefaultFont(QFont("Malgun Gothic", 11))
+    doc.setHtml(html_text)
+    doc.setTextWidth(width)
+    h = int(doc.size().height()) + 4
+    img = QImage(int(width), max(h, 50), QImage.Format.Format_ARGB32)
+    img.fill(QColor("white"))
+    p = QPainter(img)
+    doc.drawContents(p)
+    p.end()
+    img.save(path)
+    return path
+
+
+def desktop_dir():
+    d = os.path.join(os.path.expanduser("~"), "Desktop")
+    try:
+        out = _ps("[Environment]::GetFolderPath('Desktop')").stdout.strip()
+        if out and os.path.isdir(out):
+            d = out
+    except Exception:
+        pass
+    return d
+
+
+# ============================================================
+# 유지기간(환수 방지) · 부가 해지 가능일 · 할부 만료 재방문 · 자동 백업 · 정책 원본 보관
+# ============================================================
+TERM_KINDS = {"부가": "부가서비스 해지 가능", "요금제": "요금제 변경 가능", "회선": "회선 유지 끝(환수 없음)",
+              "재방문": "할부 만료 → 재방문 안내"}
+
+
+def _days_in(text):
+    m = re.search(r"(\d{2,3})\s*일", text or "")
+    return int(m.group(1)) if m else None
+
+
+def derive_terms(db, s):
+    """개통 한 건 → 지켜야 할 유지기간들 [(종류, 이름, 일수)]. 대리점 규칙 메모의 '93일' 같은 숫자를 우선 사용"""
+    if (s["category"] or "무선") != "무선":
+        return []
+    d_add = to_int(db.get("keep_addon_days", "93")) or 93
+    d_plan = to_int(db.get("keep_plan_days", "93")) or 93
+    d_line = to_int(db.get("keep_line_days", "183")) or 183
+    rules = db.effective_rules(s["sale_date"], s["agency_id"]) if s["agency_id"] else []
+    flags = set(_split(s["flags"] or ""))
+    terms, names, covered = [], set(), set()
+    for r in rules:
+        if r["kind"] in ADDON_MAIN and r["kind"] in flags:
+            nm = clean_addon_name(r["name"])
+            covered.add(r["kind"])
+            if nm not in names:
+                names.add(nm)
+                terms.append(("부가", nm, _days_in(r["memo"]) or _days_in(r["name"]) or d_add))
+    for k in flags:
+        if k in ADDON_MAIN and k not in covered:          # 대리점 규칙엔 없지만 손님이 가입한 것
+            terms.append(("부가", dict(FLAGS).get(k, k).replace(" 가입", ""), d_add))
+    plan_days, line_days = d_plan, d_line
+    for r in rules:
+        if r["kind"] != "주의":
+            continue
+        txt = f"{r['name']} {r['memo']}"
+        dd = _days_in(txt)
+        if dd and "요금" in txt:
+            plan_days = dd
+        if dd and ("해지" in txt or "환수" in txt) and "요금" not in txt:
+            line_days = max(line_days if line_days != d_line else 0, dd)
+    terms.append(("요금제", "요금제 유지", plan_days))
+    terms.append(("회선", "회선 유지(해지 시 환수)", line_days or d_line))
+    months = s["months"] if "months" in s.keys() and s["months"] is not None else 24
+    if months:
+        terms.append(("재방문", f"할부 {months}개월 만료", int(months * 30.4)))
+    return terms
+
+
+def sync_terms(db, sale_id):
+    s = db.one("SELECT * FROM sales WHERE id=?", (sale_id,))
+    if not s:
+        return
+    old = {(r["kind"], r["name"]): r for r in db.q("SELECT * FROM sale_terms WHERE sale_id=?", (sale_id,))}
+    db.con.execute("DELETE FROM sale_terms WHERE sale_id=?", (sale_id,))
+    base = datetime.date.fromisoformat(s["sale_date"])
+    for kind, name, days in derive_terms(db, s):
+        o = old.get((kind, name))
+        db.con.execute("INSERT INTO sale_terms(sale_id, kind, name, days, due, done, done_at) VALUES(?,?,?,?,?,?,?)",
+                       (sale_id, kind, name, days, (base + datetime.timedelta(days=days)).isoformat(),
+                        o["done"] if o else 0, o["done_at"] if o else None))
+    db.commit()
+
+
+def backfill_terms(db, limit=3000):
+    ids = [r["id"] for r in db.q("SELECT s.id FROM sales s LEFT JOIN sale_terms t ON t.sale_id=s.id "
+                                  "WHERE t.id IS NULL AND COALESCE(s.category,'무선')='무선' LIMIT ?", (limit,))]
+    for i in ids:
+        try:
+            sync_terms(db, i)
+        except Exception:
+            pass
+    return len(ids)
+
+
+def auto_backup(db, force=False):
+    """하루 한 번 데이터 백업 (최근 30개 보관) + 설정한 백업 폴더(구글 드라이브 등)에도 복사"""
+    d = os.path.join(BASE_DIR, "backup")
+    os.makedirs(d, exist_ok=True)
+    fn = f"phone_policy_{datetime.date.today():%Y%m%d}.db"
+    path = os.path.join(d, fn)
+    if force or not os.path.exists(path):
+        dst = sqlite3.connect(path + ".tmp")
+        db.con.backup(dst)
+        dst.close()
+        os.replace(path + ".tmp", path)
+        for f in sorted(glob.glob(os.path.join(d, "phone_policy_*.db")))[:-30]:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+        ext = db.get("backup_dir", "").strip()
+        if ext and os.path.isdir(ext):
+            pc = re.sub(r"[^0-9A-Za-z가-힣_-]", "", db.get("pc_name", "") or socket.gethostname()) or "PC"
+            shutil.copyfile(path, os.path.join(ext, f"폰정책_{pc}_{fn[13:]}"))
+        db.set("last_backup", now())
+    return path
+
+
+def archive_policy_file(db, path, aid, vf):
+    """대리점이 보낸 정책 원본 파일을 날짜·대리점별로 보관 (나중에 정산 다툼 때 증거)"""
+    try:
+        if not path or not os.path.isfile(path):
+            return
+        ag = db.one("SELECT name FROM agencies WHERE id=?", (aid,))
+        folder = os.path.join(BASE_DIR, "정책원본보관", vf, re.sub(r'[\\/:*?"<>|]', "_", ag["name"] if ag else "대리점"))
+        os.makedirs(folder, exist_ok=True)
+        dst = os.path.join(folder, os.path.basename(path))
+        if os.path.abspath(dst) != os.path.abspath(path):
+            shutil.copyfile(path, dst)
+        if not db.one("SELECT id FROM policy_files WHERE path=?", (dst,)):
+            db.x("INSERT INTO policy_files(date, agency_id, name, path, created) VALUES(?,?,?,?,?)",
+                 (vf, aid, os.path.basename(path), dst, now()))
+    except Exception:
+        pass
+
+
+class ArchiveDialog(QDialog):
+    def __init__(self, parent, db):
+        super().__init__(parent)
+        self.setWindowTitle("🗂 정책 원본 보관함")
+        self.resize(820, 520)
+        lay = QVBoxLayout(self)
+        lay.addWidget(banner("대리점이 보낸 정책 원본(엑셀·사진)이 <b>날짜·대리점별로</b> 자동 보관됩니다. "
+                             "정산 금액이 안 맞을 때 그날 받은 정책표를 바로 열어 보여줄 수 있어요. 더블클릭 = 열기"))
+        self.table = make_table(["정책 날짜", "대리점", "파일", "보관 시각"])
+        rows = db.q("SELECT f.*, a.name AS agency FROM policy_files f LEFT JOIN agencies a ON a.id=f.agency_id "
+                    "ORDER BY f.date DESC, f.id DESC")
+        self.paths = [r["path"] for r in rows]
+        fill_table(self.table, [[r["date"], r["agency"] or "", r["name"], r["created"]] for r in rows],
+                   ids=list(range(len(rows))))
+        self.table.cellDoubleClicked.connect(lambda r, _c: self.open_file(r))
+        lay.addWidget(self.table, 1)
+        b = QHBoxLayout()
+        b.addWidget(btn("📂 보관 폴더 열기", lambda: QDesktopServices.openUrl(
+            QUrl.fromLocalFile(os.path.join(BASE_DIR, "정책원본보관")))))
+        b.addStretch()
+        b.addWidget(btn("닫기", self.accept))
+        lay.addLayout(b)
+
+    def open_file(self, r):
+        i = row_id(self.table, r)
+        if i is not None and os.path.isfile(self.paths[i]):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.paths[i]))
+        else:
+            warn(self, "파일을 찾을 수 없습니다.")
 
 
 # ============================================================
@@ -1318,10 +2009,14 @@ class DB:
         self.con.executescript(SCHEMA)
         self._migrate()
         self.con.commit()
+        self.unify_models()
 
     def _migrate(self):
         def cols(t):
             return {r["name"] for r in self.q(f"PRAGMA table_info({t})")}
+        if "phone" not in cols("sales"):
+            self.con.execute("ALTER TABLE sales ADD COLUMN phone TEXT DEFAULT ''")
+            self.con.execute("ALTER TABLE sales ADD COLUMN months INTEGER DEFAULT 24")
         if "source" not in cols("sales"):
             self.con.execute("ALTER TABLE sales ADD COLUMN source TEXT DEFAULT ''")
             self.con.execute("ALTER TABLE sales ADD COLUMN remote_id INTEGER")
@@ -1370,7 +2065,7 @@ class DB:
                 pass
 
     def is_staff_pc(self):
-        return self.get("role", "관리자") == "직원"
+        return (self.get("role", "") or DEFAULT_ROLE) == "직원"
 
     def get(self, key, default=""):
         r = self.one("SELECT value FROM settings WHERE key=?", (key,))
@@ -1434,6 +2129,45 @@ class DB:
                              (sid, r["name"], r["kind"], r["amt_yes"], r["amt_no"], r["grp"], r["model_kw"],
                               r["model_ex"], r["joins"], r["fee_min"], r["fee_max"], r["memo"]))
         self.commit()
+
+    def unify_models(self):
+        """저장된 정책의 모델 이름 중 용량 없는 것 → 같은 모델 기본 용량 이름으로 (SK·KT·LG 줄이 따로 노는 것 방지)"""
+        try:
+            names = [r["model"] for r in self.q("SELECT DISTINCT model FROM policies WHERE category='무선'")]
+            mp = unify_capacity_names(names)
+            for a, b in mp.items():
+                self.con.execute("UPDATE policies SET model=? WHERE model=?", (b, a))
+                self.con.execute("UPDATE sales SET model=? WHERE model=?", (b, a))
+                self.con.execute("DELETE FROM model_meta WHERE model=?", (a,))
+            if mp:
+                self.con.commit()
+            return len(mp)
+        except Exception:
+            return 0
+
+    def model_meta(self):
+        return {r["model"]: r for r in self.q("SELECT * FROM model_meta")}
+
+    def set_meta(self, model, **kw):
+        cur = self.one("SELECT * FROM model_meta WHERE model=?", (model,))
+        d = dict(qty=None, hidden=0, fav=0) if not cur else dict(qty=cur["qty"], hidden=cur["hidden"], fav=cur["fav"])
+        d.update(kw)
+        self.x("INSERT OR REPLACE INTO model_meta(model, qty, hidden, fav) VALUES(?,?,?,?)",
+               (model, d["qty"], int(bool(d["hidden"])), int(bool(d["fav"]))), commit=False)
+
+    def visible_policies(self, date, agency_id=None):
+        """화면에 보여줄 정책: 숨긴 모델 빼고, '재고 있는 모델만' 켜져 있으면 재고 0인 모델도 뺌"""
+        meta = self.model_meta()
+        stock_only = self.get("stock_only", "0") == "1"
+        out = []
+        for p in self.effective_policies(date, agency_id):
+            m = meta.get(p["model"])
+            if m is not None and m["hidden"]:
+                continue
+            if stock_only and p["category"] == "무선" and not (m is not None and (m["qty"] or 0) > 0):
+                continue
+            out.append(p)
+        return out
 
     def find_policy(self, date, agency_id, category, carrier, model, plan, join_type):
         r = self.one(
@@ -1707,12 +2441,21 @@ def source_with_repo(src, repo):
     return re.sub(r'^UPDATE_REPO = ".*?"', f'UPDATE_REPO = "{repo}"', src, count=1, flags=re.M)
 
 
+def source_for_staff(src):
+    """직원에게 나가는 프로그램: 처음 켜면 '직원 PC' 화면 (토큰·배포 버튼 안 보임)"""
+    return re.sub(r'^DEFAULT_ROLE = ".*?"', 'DEFAULT_ROLE = "직원"', src, count=1, flags=re.M)
+
+
 def publish_source(db):
-    """배포·설치파일에 쓰는 프로그램 본문 (저장소 주소 포함)"""
+    """배포·설치파일에 쓰는 프로그램 본문 (저장소 주소 포함, 직원용)"""
     with open(this_program(), encoding="utf-8") as f:
         src = f.read()
     repo = gh_repo(db)
-    return source_with_repo(src, repo) if repo else src
+    if repo:
+        src = source_with_repo(src, repo)
+    if not db.is_staff_pc():
+        db.set("role", "관리자")          # 사장님 PC는 역할을 확실히 기록 (직원용 배포본의 기본값에 안 휘둘리게)
+    return source_for_staff(src)
 
 
 def staff_block(parent, db, what="이 작업"):
@@ -1853,6 +2596,25 @@ def make_table(headers, editable=False):
     return t
 
 
+def fit_columns(t):
+    """열 너비 정리: 금액 칸은 같은 너비로, 남는 공간은 글자 칸(비고·메모 등)만 가져가게"""
+    t.resizeColumnsToContents()
+    n, rows = t.columnCount(), min(t.rowCount(), 30)
+    if not n:
+        return
+    numeric = []
+    for c in range(n):
+        items = [t.item(r, c) for r in range(rows)]
+        items = [it for it in items if it is not None and it.text() not in ("", "-")]
+        numeric.append(bool(items) and all(isinstance(it, NumItem) for it in items))
+    for c in range(n):
+        if numeric[c]:
+            t.setColumnWidth(c, max(min(t.columnWidth(c), 110), 64))
+        elif t.columnWidth(c) > 360:
+            t.setColumnWidth(c, 360)
+    t.horizontalHeader().setStretchLastSection(not numeric[-1])
+
+
 def fill_table(t, rows, ids=None, colors=None, cell_colors=None, bold_rows=()):
     sort_col = t.horizontalHeader().sortIndicatorSection()
     sort_ord = t.horizontalHeader().sortIndicatorOrder()
@@ -1879,7 +2641,7 @@ def fill_table(t, rows, ids=None, colors=None, cell_colors=None, bold_rows=()):
                 f.setBold(True)
                 it.setFont(f)
             t.setItem(r, c, it)
-    t.resizeColumnsToContents()
+    fit_columns(t)
     if not getattr(t, "_sort_hooked", False):
         t._sort_hooked = True
         t.horizontalHeader().sectionClicked.connect(lambda _c, tt=t: setattr(tt, "_user_sorted", True))
@@ -1926,7 +2688,7 @@ def export_csv(parent, table, default_name):
 # ============================================================
 def compute_prices(db, date, agency_id, category, carrier, query, margin, unit):
     best = {}
-    for p in db.effective_policies(date, agency_id):
+    for p in db.visible_policies(date, agency_id):
         if category and p["category"] != category:
             continue
         if carrier and p["carrier"] != carrier:
@@ -2044,10 +2806,64 @@ class DropArea(QLabel):
             self.on_image(img if isinstance(img, QImage) else QImage(img))
 
 
+class SheetPickDialog(QDialog):
+    """엑셀 시트마다 읽는 방법 고르기: 정책표 / 부가·차감 조건만 / 안 읽기 (필요 없는 건 빼서 빠르게)"""
+    def __init__(self, parent, fname, sheets, saved_modes):
+        super().__init__(parent)
+        self.setWindowTitle("시트 읽는 방법 고르기")
+        self.resize(760, 520)
+        lay = QVBoxLayout(self)
+        lay.addWidget(banner(f"<b>{html.escape(fname)}</b> — 시트 {len(sheets)}개<br>"
+                             "📊 <b>정책표</b> = 모델별 금액표 · 📝 <b>조건만</b> = 부가서비스·차감 공지 · 🚫 <b>안 읽기</b> = 공시지원금표·요금제표·3G 등<br>"
+                             "프로그램이 추천해 둔 것이고, 이 대리점은 다음부터 같은 선택을 기억합니다. 🚫가 많을수록 빨라져요."))
+        self.rows = []
+        box = QWidget()
+        g = QGridLayout(box)
+        for i, (sn, grid) in enumerate(sheets):
+            mode = (saved_modes or {}).get(sn) or classify_sheet(sn, grid)
+            cb = QComboBox()
+            for k, lab in SHEET_MODES:
+                cb.addItem(lab, k)
+            cb.setCurrentIndex(max(0, cb.findData(mode)))
+            g.addWidget(QLabel(f"<b>{html.escape(sn)}</b>"), i, 0)
+            g.addWidget(QLabel(f"숫자 {grid_numeric_count(grid)}개 · 글자 {grid_char_count(grid) // 1000}천자"), i, 1)
+            g.addWidget(cb, i, 2)
+            self.rows.append((sn, cb))
+        g.setRowStretch(len(sheets), 1)
+        from PySide6.QtWidgets import QScrollArea
+        sa = QScrollArea()
+        sa.setWidgetResizable(True)
+        sa.setWidget(box)
+        lay.addWidget(sa, 1)
+        b = QHBoxLayout()
+        b.addStretch()
+        b.addWidget(btn("취소", self.reject))
+        b.addWidget(btn("✅ 이대로 읽기", self.accept, primary=True))
+        lay.addLayout(b)
+
+    def modes(self):
+        return {sn: cb.currentData() for sn, cb in self.rows}
+
+
+def apply_sheet_modes(src, all_sheets, modes):
+    src["data"] = [(sn, g) for sn, g in all_sheets if modes.get(sn) == "policy"]
+    src["rule_sheets"] = [(sn, g) for sn, g in all_sheets if modes.get(sn) == "rules"]
+
+
+def default_modes(db, aid, all_sheets):
+    saved = db.get(f"sheet_modes_{aid}", "") if aid else ""
+    try:
+        sm = json.loads(saved) if saved else {}
+    except ValueError:
+        sm = {}
+    return {sn: sm.get(sn) or classify_sheet(sn, g) for sn, g in all_sheets}
+
+
 class PolicyEditTab(QWidget):
     def __init__(self, db):
         super().__init__()
         self.db = db
+        self.last_paths = set()
         self.sources = []
         self.worker = None
         self.loaded_agency = None   # '현재 정책 불러오기' 한 대리점
@@ -2247,7 +3063,24 @@ class PolicyEditTab(QWidget):
                                f"정책 {len(prow)}줄 · 부가·차감 규칙 {len(prules)}개\n\n"
                                "① 대리점·날짜가 맞는지 확인하고 [💾 저장]을 누르세요.")
                     continue
-                self._add_source(load_source(p))
+                src = load_source(p)
+                if src["kind"] == "sheet":
+                    allsh = list(src["data"])
+                    aid = self.agency.currentData()
+                    modes = default_modes(self.db, aid, allsh)
+                    if len(allsh) > 1:
+                        dlg = SheetPickDialog(self, os.path.basename(p), allsh, modes)
+                        if dlg.exec() != QDialog.DialogCode.Accepted:
+                            continue
+                        modes = dlg.modes()
+                        if aid:
+                            self.db.set(f"sheet_modes_{aid}", json.dumps(modes, ensure_ascii=False))
+                    apply_sheet_modes(src, allsh, modes)
+                    if not src["data"] and not src["rule_sheets"]:
+                        continue
+                    src["name"] = f"{src['name']} (정책표 {len(src['data'])} · 조건 {len(src['rule_sheets'])})"
+                self.last_paths.add(p)
+                self._add_source(src)
             except Exception as ex:
                 errs.append(f"{os.path.basename(p)}: {ex}")
         if errs:
@@ -2308,6 +3141,9 @@ class PolicyEditTab(QWidget):
         self.ai_timer.start(1000)
         self.worker = AIWorker(key, pick_model(key, self.db.get("ai_model", "")), list(self.sources),
                                self.db.agency_carrier(aid), hint_txt if hint_txt in CATEGORIES else "자동 판단")
+        self.worker.existing_models = sorted({p["model"] for p in self.db.effective_policies("9999-12-31")})
+        self.worker.exclude = exclude_list(self.db.get("exclude_words", DEFAULT_EXCLUDE))
+        self.worker.tier_mode = self.db.get("tier_mode", "top") or "top"
         self.worker.progress.connect(self._set_ai_msg)
         self.worker.done.connect(self.ai_done)
         self.worker.failed.connect(self.ai_failed)
@@ -2541,8 +3377,1491 @@ class PolicyEditTab(QWidget):
         self.loaded_agency = aid
         self.from_file = False
         self.db.notify("policy")
+        for p in getattr(self, "last_paths", set()):
+            archive_policy_file(self.db, p, aid, vf)
+        self.last_paths = set()
         info(self, f"✅ 저장했습니다. ({self.agency.currentText()} · {vf}부터 적용)\n\n"
                    f"새로 들어가거나 바뀐 정책: {ins}개\n변동 없음: {same}개\n종료 처리: {ended}개\n{rmsg}")
+
+
+# ============================================================
+# 탭: 🔎 정책마진 조회 — 모델 하나 검색하면 SK·KT·LG 대리점 전부의 마진을 한눈에
+# ============================================================
+CHOICE_FLAGS = ("부가", "필링", "보험", "결합", "카드")      # 손님이 가입하면 매장이 더 받는 것들
+
+
+def margin_breakdown(rules, pol, join, fee):
+    """대리점 규칙 중 이 정책에 걸리는 것들: (부가 다 하면 가감, 부가 없이 가감, 설명 리스트, 주의 리스트)"""
+    all_on = {k: True for k in CHOICE_FLAGS}
+    up, _, warns = apply_rules(rules, pol, join, fee, all_on)
+    down, _, _ = apply_rules(rules, pol, join, fee, {})
+    desc = []
+    for r in rules:
+        if r["kind"] == "주의" or not rule_applies(r, pol, join, fee):
+            continue
+        if r["kind"] == "자동":
+            if r["amt_yes"]:
+                desc.append(f"{r['name']} {man(r['amt_yes'])}")
+        elif r["kind"] in CHOICE_FLAGS:
+            desc.append(f"{r['name']}: 하면 {man(r['amt_yes']) if r['amt_yes'] else '0'} / 안하면 "
+                        f"{man(r['amt_no']) if r['amt_no'] else '0'}")
+        else:
+            desc.append(f"{r['name']}({dict(FLAGS).get(r['kind'], r['kind'])}) {man(r['amt_yes'])}")
+    return up, down, desc, warns
+
+
+# ============================================================
+# 탭: ⭐ 한눈에 (첫 화면) — 즐겨찾기 모델 3사 최고 금액 + 최근 정책 변동
+# ============================================================
+# ============================================================
+# 탭: ⏰ 알림 — 부가 해지 가능일 · 유지기간(환수 주의) · 할부 만료 재방문
+# ============================================================
+class AlertTab(QWidget):
+    HEAD = ["기한", "D-day", "할 일", "고객", "연락처", "뒷4", "모델", "통신사", "대리점", "개통일", "담당"]
+
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+        lay = QVBoxLayout(self)
+        lay.addWidget(banner("<b>개통한 손님을 날짜별로 챙겨주는 화면</b>입니다. 개통 등록할 때 체크한 부가서비스와 대리점 조건(93일 유지 등)으로 "
+                             "날짜가 자동 계산돼요.<br>① <b>안내할 손님</b>: 부가서비스 해지해도 되는 날·요금제 바꿔도 되는 날이 된 손님 → [📋 안내 문자 복사] "
+                             "② <b>유지기간 중</b>: 아직 기간 안 끝난 손님 (이 손님이 해지·변경하러 오면 환수됨!) "
+                             "③ <b>재방문</b>: 할부 끝나가는 손님 → 기변 영업"))
+        self.summary = QLabel("")
+        self.summary.setStyleSheet("font-size:12pt;font-weight:bold;color:#1f5fbf")
+        lay.addWidget(self.summary)
+        self.inner = QTabWidget()
+        self.t_due = make_table(self.HEAD)
+        self.t_keep = make_table(self.HEAD)
+        self.t_rev = make_table(self.HEAD)
+        for t, name in ((self.t_due, "📅 안내할 손님"), (self.t_keep, "⚠ 유지기간 중 (환수 주의)"), (self.t_rev, "🔁 할부 만료 재방문")):
+            self.inner.addTab(t, name)
+        lay.addWidget(self.inner, 1)
+        b = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("고객 이름·뒷4자리 검색 (유지기간 중인지 확인할 때)")
+        self.search.returnPressed.connect(self.refresh)
+        b.addWidget(self.search)
+        b.addWidget(btn("🔎 검색", self.refresh))
+        b.addWidget(btn("📋 선택 손님 안내 문자 복사", self.copy_msg, primary=True))
+        b.addWidget(btn("✔ 안내 완료 표시", self.mark_done))
+        b.addWidget(btn("↩ 완료 취소", lambda: self.mark_done(False)))
+        b.addWidget(btn("엑셀로 내보내기", lambda: export_csv(self, self.inner.currentWidget(), f"알림_{today()}.csv")))
+        lay.addLayout(b)
+        lay.addWidget(hint("유지일 기본값(부가 93일·요금제 93일·회선 183일)은 ⚙ 설정에서 바꿀 수 있고, 대리점 규칙 메모에 '○○일'이 있으면 그걸 씁니다. "
+                           "고객 연락처·할부 개월은 📱 개통 등록에서 넣어주세요."))
+        self.items = {}
+
+    def refresh(self):
+        backfill_terms(self.db)
+        td = datetime.date.today()
+        q = self.search.text().strip()
+        sql = ("SELECT t.*, s.customer, s.phone, s.phone4, s.model, s.carrier, s.sale_date, a.name AS agency, st.name AS staff "
+               "FROM sale_terms t JOIN sales s ON s.id=t.sale_id LEFT JOIN agencies a ON a.id=s.agency_id "
+               "LEFT JOIN staff st ON st.id=s.staff_id")
+        rows = self.db.q(sql + " ORDER BY t.due")
+        if q:
+            rows = [r for r in rows if q in (r["customer"] or "") or q in (r["phone4"] or "") or q in (r["phone"] or "")]
+        due, keep, rev = [], [], []
+        for r in rows:
+            dd = (datetime.date.fromisoformat(r["due"]) - td).days
+            if r["kind"] == "재방문":
+                if -30 <= dd <= 60 and not r["done"]:
+                    rev.append((r, dd))
+            elif r["kind"] in ("부가", "요금제"):
+                if r["done"] or dd < -30:          # 한 달 넘게 지난 건 이미 지난 일로 봄
+                    continue
+                (due if dd <= 3 else keep).append((r, dd))
+            elif r["kind"] == "회선" and dd > 0:
+                keep.append((r, dd))
+        self.items = {}
+        for t, lst in ((self.t_due, due), (self.t_keep, keep), (self.t_rev, rev)):
+            data, colors, ids = [], [], []
+            for r, dd in lst:
+                ids.append(r["id"])
+                self.items[r["id"]] = r
+                label = {"부가": f"'{r['name']}' 해지 가능 안내", "요금제": "요금제 변경 가능 안내",
+                         "회선": "회선 유지 중 (해지하면 환수)", "재방문": f"{r['name']} → 재방문 안내"}[r["kind"]]
+                if t is self.t_keep and r["kind"] != "회선":
+                    label = f"'{r['name']}' 유지 중" if r["kind"] == "부가" else "요금제 유지 중"
+                data.append([r["due"], NumItem(dd, f"D{'-' if dd >= 0 else '+'}{abs(dd)}"), label, r["customer"] or "",
+                             r["phone"] or "", r["phone4"] or "", r["model"] or "", r["carrier"] or "", r["agency"] or "",
+                             r["sale_date"], r["staff"] or ""])
+                colors.append(RED if (t is self.t_keep and dd <= 14) else (YELLOW if dd < 0 else (GREEN if dd <= 0 else None)))
+            fill_table(t, data, ids=ids, colors=colors)
+        self.inner.setTabText(0, f"📅 안내할 손님 ({len(due)})")
+        self.inner.setTabText(1, f"⚠ 유지기간 중 ({len(keep)})")
+        self.inner.setTabText(2, f"🔁 할부 만료 재방문 ({len(rev)})")
+        today_n = sum(1 for _, dd in due if dd <= 0)
+        self.summary.setText(f"⏰ 오늘 안내할 손님 {today_n}명 · 3일 안에 {len(due) - today_n}명 · 재방문 대상 {len(rev)}명")
+        return today_n, len(rev)
+
+    def _sel(self):
+        t = self.inner.currentWidget()
+        return [self.items[row_id(t, r)] for r in selected_rows(t) if row_id(t, r) in self.items]
+
+    def copy_msg(self):
+        sel = self._sel()
+        if not sel:
+            return warn(self, "표에서 손님 줄을 먼저 클릭하세요. (여러 명은 Ctrl+클릭)")
+        store = self.db.get("store_name", "우리매장")
+        msgs = []
+        for r in sel:
+            name = (r["customer"] or "고객") + "님"
+            cc = {"SKT": "114(SK텔레콤)", "KT": "114(KT)", "LGU+": "114(LG유플러스)"}.get(r["carrier"], "114")
+            if r["kind"] == "부가":
+                body = (f"[{store}] {name}, 안녕하세요! {r['sale_date']}에 개통하신 {r['model']} 관련 안내드립니다.\n"
+                        f"가입하셨던 '{r['name']}'은(는) 유지기간이 끝나서 이제 해지하셔도 됩니다. "
+                        f"해지는 {cc}나 통신사 앱에서 가능하세요. 늘 감사합니다 😊")
+            elif r["kind"] == "요금제":
+                body = (f"[{store}] {name}, 안녕하세요! {r['model']} 요금제 유지기간이 끝나서 이제 원하시는 요금제로 바꾸셔도 됩니다. "
+                        f"요금제 상담 필요하시면 편하게 연락 주세요 😊")
+            elif r["kind"] == "재방문":
+                body = (f"[{store}] {name}, 안녕하세요! 쓰고 계신 {r['model']} 할부가 {r['due']}쯤 끝나갑니다. "
+                        f"새 폰으로 바꾸실 때 제일 좋은 조건으로 안내해 드릴게요. 편하게 들러주세요 🙌")
+            else:
+                body = f"(내부 확인용) {name} {r['model']} 회선 유지 {r['due']}까지 — 이전에 해지하면 환수"
+            to = r["phone"] or (f"뒷자리 {r['phone4']}" if r["phone4"] else "")
+            msgs.append((f"받는 사람: {to}\n" if to else "") + body)
+        QApplication.clipboard().setText("\n\n────────\n\n".join(msgs))
+        info(self, f"📋 안내 문자 {len(msgs)}개를 복사했습니다. 카톡·문자에 붙여넣기(Ctrl+V) 하세요.\n\n"
+                   "보낸 뒤 [✔ 안내 완료 표시]를 누르면 목록에서 빠집니다.")
+
+    def mark_done(self, done=True):
+        sel = self._sel()
+        if not sel:
+            return warn(self, "표에서 손님 줄을 먼저 클릭하세요.")
+        for r in sel:
+            self.db.x("UPDATE sale_terms SET done=?, done_at=? WHERE id=?", (1 if done else 0, now() if done else None, r["id"]),
+                      commit=False)
+        self.db.commit()
+        self.refresh()
+
+
+class DashboardTab(QWidget):
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+        lay = QVBoxLayout(self)
+        lay.addWidget(banner("<b>⭐ 즐겨찾기 모델의 SK·KT·LG 최고 정산금</b>과 <b>최근 정책 변동</b>을 한 장으로 봅니다. "
+                             "금액 = 부가·보험 다 했을 때 대리점이 주는 돈(만원), 초록 = 그 가입유형 1등 통신사. "
+                             "즐겨찾기는 🔎 정책마진 조회나 📦 모델 관리에서 ⭐를 누르면 됩니다 (없으면 최신 모델 12개)."))
+        r1 = QHBoxLayout()
+        self.fee = QComboBox()
+        self.fee.setEditable(True)
+        self.disc = discount_combo()
+        for w in [QLabel("요금(천원)"), self.fee, QLabel("  할인"), self.disc]:
+            r1.addWidget(w)
+        r1.addWidget(btn("🔄 새로고침", self.calc, primary=True))
+        r1.addStretch()
+        lay.addLayout(r1)
+        self.changes = QTextBrowser()
+        self.changes.setMaximumHeight(130)
+        lay.addWidget(self.changes)
+        self.addons = AddonPanel(db)
+        lay.addWidget(self.addons)
+        self.table = make_table(["모델"])
+        lay.addWidget(self.table, 1)
+        self.fee.activated.connect(lambda *_: self.calc())
+        self.disc.currentIndexChanged.connect(lambda *_: self.calc())
+
+    def refresh(self):
+        pols = [p for p in self.db.visible_policies(today()) if p["category"] == "무선" and fee_numbers(p["plan"])]
+        fees = sorted({min(fee_numbers(p["plan"])) for p in pols}, reverse=True)
+        cur = self.fee.currentText()
+        self.fee.blockSignals(True)
+        self.fee.clear()
+        self.fee.addItems([str(f) for f in fees] or ["115"])
+        self.fee.setCurrentText(cur or (str(fees[0]) if fees else "115"))
+        self.fee.blockSignals(False)
+        self.calc()
+
+    def calc(self):
+        fee = to_int(self.fee.currentText()) or 115
+        data = build_store_policy(self.db, today(), fee, JOIN_BY_CAT["무선"], {k: True for k in CHOICE_FLAGS}, 0, 1,
+                                  disc=self.disc.currentData())
+        meta = self.db.model_meta()
+        favs = [m for m in data if meta.get(m) is not None and meta[m]["fav"]]
+        models = sorted(favs or data, key=model_sort_key)[: (200 if favs else 12)]
+        cars = sorted({c for m in data.values() for (c, _j) in m}, key=lambda c: CARRIERS.index(c) if c in CARRIERS else 9)
+        joins = JOIN_BY_CAT["무선"]
+        short = {"신규": "신규", "번호이동": "번이", "기기변경": "기변"}
+        heads = ["모델"] + [f"{c} {short[j]}" for c in cars for j in joins] + ["번이 1등"]
+        self.table.setSortingEnabled(False)
+        self.table.setColumnCount(len(heads))
+        self.table.setHorizontalHeaderLabels(heads)
+        rows, cc = [], {}
+        for r, m in enumerate(models):
+            line = [("⭐ " if m in favs else "") + m]
+            for j in joins:
+                cand = [c for c in cars if (c, j) in data[m]]
+                if cand:
+                    b = max(cand, key=lambda c: data[m][(c, j)]["net"])
+                    cc[(r, 1 + cars.index(b) * len(joins) + joins.index(j))] = GREEN
+            for c in cars:
+                for j in joins:
+                    d = data[m].get((c, j))
+                    if d:
+                        it = NumItem(d["net"], f"{d['net'] / 10000:g}")
+                        it.setToolTip(f"{d['agency']} · {d['plan']}")
+                        line.append(it)
+                    else:
+                        line.append(txt_item("-"))
+            cand = [c for c in cars if (c, "번호이동") in data[m]]
+            if cand:
+                b = max(cand, key=lambda c: data[m][(c, "번호이동")]["net"])
+                line.append(f"{b} {data[m][(b, '번호이동')]['agency']} {data[m][(b, '번호이동')]['net'] / 10000:g}만")
+            else:
+                line.append("-")
+            rows.append(line)
+        fill_table(self.table, rows, cell_colors=cc)
+        try:
+            ch = json.loads(self.db.get("last_changes", "[]") or "[]")
+        except ValueError:
+            ch = []
+        self.addons.fill(today())
+        self.changes.setHtml("<b>📈 최근 정책 변동</b> " + (f"({html.escape(self.db.get('last_changes_date', ''))})<br>" if ch else
+                             "— 아직 없음 (📥 정책 일괄 등록으로 새 정책을 올리면 여기에 오른/내린 모델이 나옵니다)")
+                             + "<br>".join(html.escape(x) for x in ch[:12]))
+
+
+# ============================================================
+# 탭: 📦 모델 관리 — 재고 · 숨기기 · 즐겨찾기 (옛날 모델·재고 없는 모델 정리)
+# ============================================================
+class ModelsTab(QWidget):
+    COLS = ["⭐ 즐겨찾기", "🙈 숨김", "재고", "모델", "출고가", "정책 있는 통신사", "숨길 후보 이유"]
+
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+        lay = QVBoxLayout(self)
+        lay.addWidget(banner("<b>모델 정리</b>: 옛날 모델·재고 없는 모델은 <b>🙈 숨김</b>에 체크하면 모든 조회·판매정책·엑셀에서 빠집니다 "
+                             "(새 정책을 올려도 계속 숨겨져 있어요). <b>재고</b> 칸에 수량을 적고 아래 '재고 있는 모델만 보기'를 켜면 "
+                             "기계 있는 모델만 나옵니다. 최신 모델이 위에 옵니다."))
+        r1 = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("모델 검색")
+        self.stock_only = QCheckBox("📦 재고 있는 모델만 조회·판매정책에 보이기")
+        r1.addWidget(self.search)
+        r1.addWidget(btn("🧹 숨길 후보 자동 체크", self.auto_hide))
+        r1.addWidget(btn("📦 재고 엑셀 올리기", self.import_stock))
+        r1.addWidget(self.stock_only)
+        r1.addStretch()
+        r1.addWidget(btn("💾 저장", self.save, primary=True, big=True))
+        lay.addLayout(r1)
+        self.table = make_table(self.COLS, editable=True)
+        lay.addWidget(self.table, 1)
+        lay.addWidget(hint("재고 칸은 숫자만 (비워두면 '모름'). 재고 엑셀은 첫 줄에 '모델'과 '수량(재고)' 제목이 있으면 이름을 알아서 맞춥니다."))
+        self.search.textChanged.connect(lambda *_: self.render())
+        self.info = {}
+
+    def refresh(self):
+        self.stock_only.setChecked(self.db.get("stock_only", "0") == "1")
+        info = {}
+        for p in self.db.effective_policies(today()):
+            if p["category"] != "무선":
+                continue
+            d = info.setdefault(p["model"], dict(release=0, cars=set(), nets=[]))
+            d["release"] = max(d["release"], p["release_price"] or 0)
+            d["cars"].add(p["carrier"])
+            d["nets"].append(p["rebate"] - p["deduction"])
+        self.info = info
+        self.render()
+
+    def _reasons(self, m, d):
+        rs = []
+        if not d["release"]:
+            rs.append("출고가 없음(#N/A)")
+        if d["nets"] and max(d["nets"]) < 0:
+            rs.append("모든 정책 마이너스")
+        y, _ = model_year(m)
+        if y and y <= datetime.date.today().year - 3:
+            rs.append(f"{y}년쯤 모델")
+        return rs
+
+    def render(self):
+        meta = self.db.model_meta()
+        q = norm_model(self.search.text())
+        models = sorted((m for m in self.info if not q or q in norm_model(m)),
+                        key=lambda m: model_sort_key(m, self.info[m]["release"]))
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(models))
+        for r, m in enumerate(models):
+            d, mt = self.info[m], meta.get(m)
+            for c, on in ((0, mt is not None and mt["fav"]), (1, mt is not None and mt["hidden"])):
+                it = QTableWidgetItem("")
+                it.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                it.setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
+                self.table.setItem(r, c, it)
+            qty = "" if (mt is None or mt["qty"] is None) else str(mt["qty"])
+            self.table.setItem(r, 2, txt_item(qty, editable=True))
+            it = txt_item(m)
+            it.setData(ID_ROLE, m)
+            self.table.setItem(r, 3, it)
+            self.table.setItem(r, 4, NumItem(d["release"]))
+            self.table.setItem(r, 5, txt_item(" ".join(sorted(d["cars"], key=lambda c: CARRIERS.index(c) if c in CARRIERS else 9))))
+            rs = self._reasons(m, d)
+            it = txt_item(" · ".join(rs))
+            if rs:
+                it.setBackground(QBrush(YELLOW))
+            self.table.setItem(r, 6, it)
+        self.table.resizeColumnsToContents()
+
+    def auto_hide(self):
+        n = 0
+        for r in range(self.table.rowCount()):
+            if self.table.item(r, 6).text():
+                self.table.item(r, 1).setCheckState(Qt.CheckState.Checked)
+                n += 1
+        info(self, f"숨길 후보 {n}개에 체크했습니다. 확인하고 필요한 건 체크를 풀고 [💾 저장]을 누르세요.")
+
+    def import_stock(self):
+        path, _ = QFileDialog.getOpenFileName(self, "재고 엑셀", "", "엑셀/CSV (*.xlsx *.xls *.csv)")
+        if not path:
+            return
+        try:
+            sheets = read_sheets(path)
+        except Exception as ex:
+            return warn(self, str(ex))
+        keys = {norm_model(m): m for m in self.info}
+        got, miss = 0, []
+        for _n, data in sheets:
+            hi, mp = map_headers(data, [["모델", "기종", "펫네임", "품명"], ["수량", "재고", "개수"]], required=0)
+            if hi is None or 1 not in mp:
+                continue
+            for row in data[hi + 1:]:
+                name = str(row[mp[0]]).strip() if mp[0] < len(row) else ""
+                if not name:
+                    continue
+                qty = to_int(row[mp[1]]) if mp[1] < len(row) else 0
+                k = norm_model(name)
+                m = keys.get(k) or next((v for kk, v in keys.items() if k and (k in kk or kk in k)), None)
+                if m:
+                    self.db.set_meta(m, qty=qty)
+                    got += 1
+                else:
+                    miss.append(name)
+        self.db.commit()
+        self.render()
+        info(self, f"재고 {got}개 반영했습니다." + (f"\n\n못 맞춘 이름 {len(miss)}개:\n" + "\n".join(miss[:20]) if miss else ""))
+
+    def save(self):
+        for r in range(self.table.rowCount()):
+            m = self.table.item(r, 3).data(ID_ROLE)
+            qtxt = self.table.item(r, 2).text().strip()
+            self.db.set_meta(m, fav=self.table.item(r, 0).checkState() == Qt.CheckState.Checked,
+                             hidden=self.table.item(r, 1).checkState() == Qt.CheckState.Checked,
+                             qty=(to_int(qtxt) if qtxt else None))
+        self.db.set("stock_only", "1" if self.stock_only.isChecked() else "0")
+        self.db.commit()
+        self.db.notify("policy")
+        info(self, "저장했습니다. 모든 조회·판매정책에 바로 반영됩니다.")
+
+
+# ============================================================
+# 탭: 🧾 손님 견적서 — 3사 할부원금·월 납부액 비교, 카톡 이미지
+# ============================================================
+class QuoteTab(QWidget):
+    RATE = 0.059     # 통신사 할부 수수료(연)
+
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+        self.last_html = ""
+        lay = QVBoxLayout(self)
+        lay.addWidget(banner("<b>손님 견적서</b>: 모델·가입유형·요금제를 고르면 SK·KT·LG 각각 제일 좋은 조건으로 "
+                             "<b>할부원금 · 월 할부금 · 월 요금 · 월 예상 납부액</b>을 계산합니다. [🖼 카톡용 이미지]로 손님에게 보내세요."))
+        r1 = QHBoxLayout()
+        self.model = QComboBox()
+        self.model.setEditable(True)
+        self.model.setMinimumWidth(260)
+        self.join = QComboBox()
+        self.join.addItems(JOIN_BY_CAT["무선"])
+        self.join.setCurrentText("번호이동")
+        self.fee = QSpinBox()
+        self.fee.setRange(10, 300)
+        self.fee.setValue(115)
+        self.fee.setSuffix(" 천원")
+        self.disc = discount_combo()
+        self.months = QComboBox()
+        self.months.addItems(["24", "36", "12"])
+        self.customer = QLineEdit()
+        self.customer.setPlaceholderText("손님 이름(선택)")
+        for w in [QLabel("모델"), self.model, QLabel(" 가입"), self.join, QLabel(" 요금제 월"), self.fee,
+                  QLabel(" 할인"), self.disc, QLabel(" 할부"), self.months, QLabel("개월"), self.customer]:
+            r1.addWidget(w)
+        r1.addStretch()
+        lay.addLayout(r1)
+        fb = QGroupBox("손님이 가입할 부가서비스 (체크한 만큼 지원금에 반영)")
+        fl = QVBoxLayout(fb)
+        self.flags = FlagBox()
+        fl.addWidget(self.flags)
+        lay.addWidget(fb)
+        r2 = QHBoxLayout()
+        r2.addWidget(btn("🧾 견적 계산", self.calc, primary=True, big=True))
+        r2.addWidget(btn("🖼 카톡용 이미지", self.image, primary=True))
+        r2.addStretch()
+        lay.addLayout(r2)
+        self.view = QTextBrowser()
+        lay.addWidget(self.view, 1)
+
+    def refresh(self):
+        names = sorted({p["model"] for p in self.db.visible_policies(today()) if p["category"] == "무선"}, key=model_sort_key)
+        cur = self.model.currentText()
+        self.model.blockSignals(True)
+        self.model.clear()
+        self.model.addItems(names)
+        if cur:
+            self.model.setCurrentText(cur)
+        self.model.blockSignals(False)
+
+    def monthly(self, principal, n):
+        if principal <= 0:
+            return 0
+        r = self.RATE / 12
+        return int(round(principal * r / (1 - (1 + r) ** -n)))
+
+    def calc(self):
+        model = self.model.currentText().strip()
+        join, fee, disc, n = self.join.currentText(), self.fee.value(), self.disc.currentData(), int(self.months.currentText())
+        data = build_store_policy(self.db, today(), fee, [join], self.flags.get(),
+                                  to_int(self.db.get("target_margin", "100000")),
+                                  to_int(self.db.get("round_unit", "10000")) or 1, disc=disc)
+        key = norm_model(model)
+        m = next((k for k in data if norm_model(k) == key), None) or next((k for k in data if key and key in norm_model(k)), None)
+        if not m:
+            self.view.setHtml("")
+            return warn(self, "이 모델의 정책이 없습니다.")
+        cars = [c for c in CARRIERS if (c, join) in data[m]] + \
+               [c for (c, j) in data[m] if j == join and c not in CARRIERS]
+        colc = {"SKT": "#E8412C", "KT": "#222222", "LGU+": "#C4006B"}
+        rows = {k: [] for k in ("출고가", "공시지원금", "매장 추가지원금", "할부원금", f"월 할부금({n}개월)", "월 요금", "월 예상 납부액")}
+        totals = {}
+        for c in cars:
+            d = data[m][(c, join)]
+            pub = 0 if disc == "선약" else d["public"]
+            principal = max(0, d["release"] - pub - d["sup"])
+            mfee = int(fee * 1000 * (0.75 if disc == "선약" else 1))
+            inst = self.monthly(principal, n)
+            totals[c] = inst + mfee
+            for k, v in zip(rows, (d["release"], pub, d["sup"], principal, inst, mfee, inst + mfee)):
+                rows[k].append(v)
+        best = min(totals, key=totals.get) if totals else None
+        store = html.escape(self.db.get("store_name", "우리매장"))
+        who = html.escape(self.customer.text().strip())
+        h = [f"<h2 style='color:#1f3a5f'>{store} 견적서</h2>",
+             f"<p><b>{html.escape(m)}</b> · {join} · 요금제 월 {fee:,}천원 · {self.disc.currentText()}"
+             f"{' · 선택약정 25% 할인' if disc == '선약' else ''}{' · ' + who + ' 고객님' if who else ''} · {today()}</p>",
+             "<table border='1' cellspacing='0' cellpadding='7'><tr><th bgcolor='#eef1f5'></th>"]
+        for c in cars:
+            h.append(f"<th bgcolor='{colc.get(c, '#555')}'><font color='white'>{c}{' ⭐추천' if c == best else ''}</font></th>")
+        h.append("</tr>")
+        for k, vals in rows.items():
+            tag = k == "월 예상 납부액"
+            h.append(f"<tr><td bgcolor='#f7f7f7'><b>{k}</b></td>" + "".join(
+                (f"<td align='right' bgcolor='#d8f3df'><b>{v:,}원</b></td>" if tag and c == best else
+                 f"<td align='right'>{'<b>' if tag else ''}{v:,}원{'</b>' if tag else ''}</td>")
+                for c, v in zip(cars, vals)) + "</tr>")
+        h.append("</table><p style='color:#777'>※ 할부 수수료 연 5.9% 기준 예상 금액이며, 요금제·부가서비스 유지 조건이 있을 수 있습니다. "
+                 "정확한 금액은 개통 시 안내드립니다.</p>")
+        self.last_html = "".join(h)
+        self.view.setHtml(self.last_html)
+
+    def image(self):
+        if not self.last_html:
+            self.calc()
+            if not self.last_html:
+                return
+        path = os.path.join(desktop_dir(), f"견적서_{norm_model(self.model.currentText())}_{today()}.png")
+        html_to_png(self.last_html, 760, path)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        info(self, f"✅ 견적서 이미지를 만들었습니다.\n{path}\n\n카톡으로 손님에게 보내면 됩니다.")
+
+
+def _selected_models(table, col):
+    rows = selected_rows(table)
+    return sorted({table.item(r, col).text() for r in rows if table.item(r, col) and table.item(r, col).text()
+                   and not table.item(r, col).text().startswith("【")})
+
+
+def hide_selected(parent, table, col, after=None):
+    ms = _selected_models(table, col)
+    if not ms:
+        return warn(parent, "표에서 숨길 모델 줄을 먼저 클릭하세요. (여러 개는 Ctrl+클릭)")
+    if not ask(parent, "이 모델들을 숨길까요? 모든 조회·판매정책·엑셀에서 빠집니다.\n(📦 모델 관리 탭에서 다시 보이게 할 수 있어요)\n\n"
+                       + "\n".join(ms[:15])):
+        return
+    for m in ms:
+        parent.db.set_meta(m, hidden=1)
+    parent.db.commit()
+    if after:
+        after()
+
+
+def fav_selected(parent, table, col):
+    ms = _selected_models(table, col)
+    if not ms:
+        return warn(parent, "표에서 즐겨찾기할 모델 줄을 먼저 클릭하세요.")
+    for m in ms:
+        parent.db.set_meta(m, fav=1)
+    parent.db.commit()
+    info(parent, "⭐ 즐겨찾기에 넣었습니다. '⭐ 한눈에' 탭 첫 화면에 나옵니다.\n\n" + "\n".join(ms[:15]))
+
+
+class MarginTab(QWidget):
+    JOINS = ("신규", "번호이동", "기기변경")
+    SHORT = {"신규": "신규", "번호이동": "번이", "기기변경": "기변"}
+
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+        lay = QVBoxLayout(self)
+        lay.addWidget(banner("<b>모델만 검색하면 SK·KT·LG 대리점 전부의 정책마진이 한 화면에</b> 나옵니다.<br>"
+                             "가입유형마다 <b>정책표 기본</b> · <b>부가·보험 다 하면</b> · <b>부가 없이</b> 3가지 금액과, 대리점별 부가·차감 내역을 같이 보여줘요. "
+                             "초록 = 그 모델·가입유형에서 제일 많이 주는 곳."))
+        r1 = QHBoxLayout()
+        self.search = QComboBox()
+        self.search.setEditable(True)
+        self.search.setMinimumWidth(320)
+        self.search.lineEdit().setPlaceholderText("모델 검색  예: S26 / 플립7 / 아이폰17")
+        f = self.search.font()
+        f.setPointSize(13)
+        self.search.setFont(f)
+        self.fee = QComboBox()
+        self.fee.setEditable(True)
+        self.fee.setToolTip("손님 요금제 월정액(천원). 통신사마다 요금제 이름이 달라도 이 금액 기준으로 맞춤")
+        self.date = date_edit()
+        self.disc = discount_combo()
+        for w in [QLabel("🔎"), self.search, QLabel("  요금(천원)"), self.fee, QLabel("  할인"), self.disc,
+                  QLabel("  날짜"), self.date]:
+            r1.addWidget(w)
+        r1.addWidget(btn("조회", self.calc, primary=True, big=True))
+        r1.addWidget(btn("엑셀로 내보내기", lambda: export_csv(self, self.table, f"정책마진_{dstr(self.date)}.csv")))
+        r1.addWidget(btn("🙈 선택 모델 숨기기", lambda: hide_selected(self, self.table, 0, self.calc)))
+        r1.addWidget(btn("⭐ 즐겨찾기", lambda: fav_selected(self, self.table, 0)))
+        r1.addStretch()
+        lay.addLayout(r1)
+        self.summary = QTextBrowser()
+        self.summary.setMaximumHeight(120)
+        lay.addWidget(self.summary)
+        heads = ["모델", "통신사", "대리점", "적용 요금 구간"]
+        for j in self.JOINS:
+            heads += [f"{self.SHORT[j]} 기본", f"{self.SHORT[j]} 부가다함", f"{self.SHORT[j]} 부가없이"]
+        heads += ["부가·차감 내역", "⚠ 주의"]
+        self.table = make_table(heads)
+        lay.addWidget(self.table, 1)
+        lay.addWidget(hint("기본 = 정책표 금액(고정 차감 반영) · 부가다함 = 부가서비스·필링·보험 등 손님이 전부 가입했을 때 · "
+                           "부가없이 = 아무것도 안 했을 때 (요금제·기변 조건 같은 '자동' 가감은 둘 다 반영). 금액 단위: 만원. "
+                           "단기기변·시니어 같은 특수 조건은 🏆 최적 대리점 탭에서 체크해서 보세요."))
+        self.search.lineEdit().returnPressed.connect(self.calc)
+        self.search.activated.connect(lambda *_: self.calc())
+
+    def refresh(self):
+        pols = [p for p in self.db.visible_policies(dstr(self.date)) if p["category"] == "무선"]
+        fees = sorted({min(fee_numbers(p["plan"])) for p in pols if fee_numbers(p["plan"])}, reverse=True)
+        cur = self.fee.currentText()
+        self.fee.blockSignals(True)
+        self.fee.clear()
+        self.fee.addItems([str(x) for x in fees] or ["115"])
+        self.fee.setCurrentText(cur or (str(fees[0]) if fees else "115"))
+        self.fee.blockSignals(False)
+        names = sorted({p["model"] for p in pols}, key=model_sort_key)
+        txt = self.search.currentText()
+        self.search.blockSignals(True)
+        self.search.clear()
+        self.search.addItems(names)
+        self.search.setCurrentIndex(-1)
+        self.search.setEditText(txt)
+        self.search.blockSignals(False)
+
+    def calc(self):
+        q = norm_model(self.search.currentText())
+        if not q:
+            return warn(self, "모델을 입력하세요. 예: S26")
+        fee = to_int(self.fee.currentText()) or 115
+        date = dstr(self.date)
+        pols = [p for p in self.db.visible_policies(date)
+                if p["category"] == "무선" and q in norm_model(p["model"]) and fee_numbers(p["plan"])]
+        exact = [p for p in pols if norm_model(p["model"]) == q]
+        if exact:
+            pols = exact
+        if not pols:
+            fill_table(self.table, [])
+            self.summary.setHtml("")
+            return warn(self, "그 모델의 정책이 없습니다. 모델 이름을 다르게 검색해 보세요. (예: S26, 플립7, 아이폰17)")
+        rules = {}
+        groups = {}
+        for p in pols:
+            groups.setdefault((p["model"], p["agency_id"]), {}).setdefault(p["join_type"], []).append(p)
+        rows = []
+        for (model, aid), by_join in groups.items():
+            if aid not in rules:
+                rules[aid] = self.db.effective_rules(date, aid)
+            rec = dict(model=model, aid=aid, vals={}, desc=[], warns=[], plan="", carrier="", agency="")
+            for j in self.JOINS:
+                best = None
+                for p in pick_by_fee(by_discount(by_join.get(j, []), self.disc.currentData()), fee):
+                    if not fee_numbers(p["plan"]):
+                        continue
+                    base = p["rebate"] - p["deduction"]
+                    up, down, desc, warns = margin_breakdown(rules[aid], p, j, fee)
+                    if best is None or base + up > best[1]:
+                        best = (base, base + up, base + down, desc, warns, p)
+                if best:
+                    rec["vals"][j] = best[:3]
+                    p = best[5]
+                    rec.update(plan=p["plan"], carrier=p["carrier"], agency=p["agency"])
+                    for d in best[3]:
+                        if d not in rec["desc"]:
+                            rec["desc"].append(d)
+                    for w in best[4]:
+                        if w not in rec["warns"]:
+                            rec["warns"].append(w)
+            if rec["vals"]:
+                rows.append(rec)
+        # 모델별로, 통신사 순, 부가다함 번이 큰 순
+        rows.sort(key=lambda r: (model_sort_key(r["model"]), CARRIERS.index(r["carrier"]) if r["carrier"] in CARRIERS else 9,
+                                 -(r["vals"].get("번호이동", (0, 0, 0))[1])))
+        best_cell = {}
+        for r in rows:
+            for j, v in r["vals"].items():
+                for k in range(3):
+                    key = (r["model"], j, k)
+                    best_cell[key] = max(best_cell.get(key, -10 ** 12), v[k])
+        data, cc = [], {}
+        for i, r in enumerate(rows):
+            line = [r["model"], r["carrier"], r["agency"], re.sub(r"\s*\[.*?\]", "", r["plan"])]
+            for jn, j in enumerate(self.JOINS):
+                v = r["vals"].get(j)
+                for k in range(3):
+                    if not v:
+                        line.append(txt_item("-"))
+                        continue
+                    it = NumItem(v[k], f"{v[k] / 10000:g}")
+                    line.append(it)
+                    if v[k] == best_cell[(r["model"], j, k)] and len(rows) > 1:
+                        cc[(i, 4 + jn * 3 + k)] = GREEN
+                    elif v[k] < 0:
+                        cc[(i, 4 + jn * 3 + k)] = RED
+            line += [" / ".join(r["desc"]) or "-", " / ".join(r["warns"])]
+            data.append(line)
+        self.table._user_sorted = False
+        fill_table(self.table, data, cell_colors=cc)
+        # 요약: 모델·가입유형별 1등 (부가다함 / 부가없이)
+        html_lines = []
+        for model in sorted({r["model"] for r in rows}, key=model_sort_key):
+            rs = [r for r in rows if r["model"] == model]
+            parts = []
+            for j in self.JOINS:
+                c = [r for r in rs if j in r["vals"]]
+                if not c:
+                    continue
+                a = max(c, key=lambda r: r["vals"][j][1])
+                b = max(c, key=lambda r: r["vals"][j][2])
+                parts.append(f"<b>{self.SHORT[j]}</b> 부가다함 {a['carrier']} {html.escape(a['agency'])} "
+                             f"<b style='color:#1a7f37'>{a['vals'][j][1] / 10000:g}만</b> · 부가없이 {b['carrier']} "
+                             f"{html.escape(b['agency'])} <b>{b['vals'][j][2] / 10000:g}만</b>")
+            per_car = {}
+            for r in rs:
+                v = r["vals"].get("번호이동") or next(iter(r["vals"].values()))
+                if r["carrier"] not in per_car or v[1] > per_car[r["carrier"]][0]:
+                    per_car[r["carrier"]] = (v[1], r["agency"])
+            cars = "  ".join(f"{c} {per_car[c][0] / 10000:g}만({html.escape(per_car[c][1])})"
+                             for c in sorted(per_car, key=lambda c: CARRIERS.index(c) if c in CARRIERS else 9))
+            html_lines.append(f"📱 <b>{html.escape(model)}</b> ({fee}요금)  —  통신사별 최고(번이·부가다함): {cars}<br>"
+                              "&nbsp;&nbsp;&nbsp;&nbsp;" + "  |  ".join(parts))
+        self.summary.setHtml("<br>".join(html_lines))
+
+
+# ============================================================
+# 탭: 정책 일괄 등록 (9개 대리점 파일 한꺼번에 → 버튼 한 번)
+# ============================================================
+def guess_carrier_from_src(src):
+    """파일 안 글자로 통신사 추측 (파일 이름에 통신사가 없을 때)"""
+    if src.get("kind") != "sheet":
+        return None
+    txt = " ".join(str(v) for _, g in src.get("data", [])[:3] for row in g[:60] for v in row if str(v).strip())
+    score = {"SKT": 0, "KT": 0, "LGU+": 0}
+    score["SKT"] += len(re.findall(r"5GX|베스트\d|T우주|티다문|에스케이|SKT|P_119|I_100", txt))
+    score["KT"] += len(re.findall(r"초이스|티지밀|요고|\bKT\b|NK\b|NK_|NK\d|케이티|110K", txt))
+    score["LGU+"] += len(re.findall(r"플러스 ?플랜|U\+|유플|LGU|엘지|데이터 ?플랜|115군", txt))
+    best = max(score, key=score.get)
+    return best if score[best] >= 2 else None
+
+
+def guess_agency(fname, agencies, used, src=None):
+    low = fname.lower().replace(" ", "")
+    for a in agencies:
+        n = a["name"].lower().replace(" ", "")
+        if n and n in low:
+            return a["id"]
+    car = None
+    if re.search(r"skt|sk|에스케이|티월드", low):
+        car = "SKT"
+    elif re.search(r"kt|케이티", low):
+        car = "KT"
+    elif re.search(r"lg|u\+|유플|엘지", low):
+        car = "LGU+"
+    if not car and src is not None:
+        car = guess_carrier_from_src(src)
+    if car:
+        for a in agencies:
+            if a["carrier"] == car and a["id"] not in used:
+                return a["id"]
+    return None
+
+
+def file_hash(path, extra=""):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    h.update(("|" + extra + "|v3").encode("utf-8"))
+    return h.hexdigest()
+
+
+class BatchTab(QWidget):
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+        self.items = []      # dict(path, name, src, sheets_all, hash)
+        self.worker = None
+        lay = QVBoxLayout(self)
+        lay.addWidget(banner("<b>대리점 정책 파일을 전부 먼저 올리고 → 버튼 한 번</b>이면 한꺼번에 읽어서 <b>대리점별로 자동 저장</b>합니다.<br>"
+                             "① 파일 9개를 다 끌어다 놓기 → ② 파일마다 대리점이 맞는지 확인(파일 이름으로 자동 추측) → "
+                             "③ <b>[🤖 전부 읽고 저장]</b>. 한 번 읽은 파일은 기억해서 다음엔 바로 끝납니다."))
+        top = QHBoxLayout()
+        self.date = date_edit()
+        top.addWidget(QLabel("정책 적용 날짜"))
+        top.addWidget(self.date)
+        top.addWidget(QLabel("  📶 요금 구간"))
+        self.tier = QComboBox()
+        for k, lab in TIER_MODES:
+            self.tier.addItem(lab, k)
+        self.tier.setToolTip("SK처럼 요금 구간이 많은 정책표는 '제일 높은 구간만' 읽으면 훨씬 빠릅니다.")
+        self.tier.currentIndexChanged.connect(lambda *_: self.db.set("tier_mode", self.tier.currentData()))
+        top.addWidget(self.tier)
+        top.addWidget(QLabel("  🚫 빼고 읽기"))
+        self.exclude = QLineEdit()
+        self.exclude.setMinimumWidth(260)
+        self.exclude.setToolTip("여기 적은 말이 들어간 표·요금제·모델은 안 읽습니다 (빨라짐).\n예: 3G, 2G, 선불, 키즈, 태블릿, 워치\n쉼표로 구분")
+        self.exclude.editingFinished.connect(self._save_ex)
+        top.addWidget(self.exclude)
+        top.addWidget(btn("📁 파일 추가", self.pick))
+        top.addWidget(btn("선택 줄 빼기", self.remove_sel))
+        top.addWidget(btn("목록 비우기", self.clear))
+        top.addStretch()
+        lay.addLayout(top)
+        self.drop = DropArea(self.add_files, lambda img: None, self.pick)
+        self.drop.setText("📂  대리점 정책 엑셀·PDF·사진 파일을 여기로 한꺼번에 끌어다 놓으세요 (여러 개 가능)")
+        lay.addWidget(self.drop)
+        self.table = make_table(["파일", "대리점 (확인·변경)", "읽을 시트", "상태"], editable=False)
+        lay.addWidget(self.table, 1)
+        b = QHBoxLayout()
+        self.b_run = btn("🤖 전부 읽고 저장", self.run, primary=True, big=True)
+        self.b_stop = btn("■ 중단", self.stop)
+        self.b_stop.hide()
+        b.addWidget(self.b_run)
+        b.addWidget(self.b_stop)
+        self.status = QLabel("")
+        self.status.setStyleSheet("color:#1f5fbf;font-weight:bold")
+        self.status.setWordWrap(True)
+        b.addWidget(self.status, 1)
+        lay.addLayout(b)
+        self.result = QTextBrowser()
+        self.result.setMaximumHeight(170)
+        lay.addWidget(self.result)
+        lay.addWidget(btn("🗂 정책 원본 보관함 (대리점이 보낸 파일 날짜별 보관)", lambda: ArchiveDialog(self, self.db).exec()))
+        self.sec = 0
+        self.msg = ""
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+
+    def refresh(self):
+        self.tier.blockSignals(True)
+        self.tier.setCurrentIndex(max(0, self.tier.findData(self.db.get("tier_mode", "top") or "top")))
+        self.tier.blockSignals(False)
+        self.exclude.setText(self.db.get("exclude_words", DEFAULT_EXCLUDE))
+        _CURRENT_EXCLUDE[0] = self.exclude.text()
+
+    def _save_ex(self):
+        self.db.set("exclude_words", self.exclude.text().strip())
+        _CURRENT_EXCLUDE[0] = self.exclude.text()
+        for it in self.items:
+            if it["sheets_all"] is not None:
+                self._auto_sheets(it)
+        self.render()
+
+    def _tick(self):
+        self.sec += 1
+        self.status.setText(f"{self.msg}   ⏱ {self.sec // 60}분 {self.sec % 60:02d}초")
+
+    def pick(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "대리점 정책 파일 선택", "",
+                                                "정책 파일 (*.xlsx *.xlsm *.xls *.csv *.png *.jpg *.jpeg *.webp *.pdf)")
+        if paths:
+            self.add_files(paths)
+
+    def add_files(self, paths):
+        errs = []
+        ags = self.db.agencies()
+        for p in paths:
+            try:
+                src = load_source(p)
+            except Exception as ex:
+                errs.append(f"{os.path.basename(p)}: {ex}")
+                continue
+            used = {it["agency"] for it in self.items}
+            aid = guess_agency(os.path.basename(p), ags, used, src)
+            it = dict(path=p, name=os.path.basename(p), src=src, agency=aid,
+                      sheets_all=list(src["data"]) if src["kind"] == "sheet" else None)
+            if src["kind"] == "sheet":
+                self._auto_sheets(it)
+            self.items.append(it)
+        self.render()
+        if errs:
+            warn(self, "\n".join(errs))
+
+    def _auto_sheets(self, it):
+        it["modes"] = default_modes(self.db, it["agency"], it["sheets_all"])
+        apply_sheet_modes(it["src"], it["sheets_all"], it["modes"])
+
+    def render(self):
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(self.items))
+        ags = self.db.agencies()
+        for r, it in enumerate(self.items):
+            self.table.setItem(r, 0, txt_item(it["name"]))
+            cb = QComboBox()
+            cb.addItem("⚠ 대리점을 골라주세요", None)
+            for a in ags:
+                cb.addItem(f"{a['name']}  ({a['carrier']})", a["id"])
+            cb.setCurrentIndex(max(0, cb.findData(it["agency"])))
+            cb.currentIndexChanged.connect(lambda _i, it=it, cb=cb: self._set_agency(it, cb.currentData()))
+            self.table.setCellWidget(r, 1, cb)
+            if it["sheets_all"] is not None:
+                b = QPushButton(f"📊{len(it['src']['data'])} 📝{len(it['src'].get('rule_sheets', []))} "
+                                f"🚫{len(it['sheets_all']) - len(it['src']['data']) - len(it['src'].get('rule_sheets', []))} (바꾸기)")
+                b.clicked.connect(lambda _=False, it=it: self._choose_sheets(it))
+                self.table.setCellWidget(r, 2, b)
+            else:
+                self.table.setItem(r, 2, txt_item({"image": "사진", "pdf": "PDF", "text": "글"}.get(it["src"]["kind"], "")))
+            self.table.setItem(r, 3, txt_item(it.get("state", "대기")))
+        self.table.resizeColumnsToContents()
+        self.table.setColumnWidth(1, max(self.table.columnWidth(1), 230))
+
+    def _set_agency(self, it, aid):
+        it["agency"] = aid
+        if it["sheets_all"] is not None:
+            self._auto_sheets(it)
+        self.render()
+
+    def _choose_sheets(self, it):
+        dlg = SheetPickDialog(self, it["name"], it["sheets_all"], it.get("modes"))
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            it["modes"] = dlg.modes()
+            apply_sheet_modes(it["src"], it["sheets_all"], it["modes"])
+            if it["agency"]:
+                self.db.set(f"sheet_modes_{it['agency']}", json.dumps(it["modes"], ensure_ascii=False))
+            self.render()
+
+    def remove_sel(self):
+        for r in reversed(selected_rows(self.table)):
+            self.items.pop(r)
+        self.render()
+
+    def clear(self):
+        self.items = []
+        self.render()
+        self.result.clear()
+
+    def stop(self):
+        if self.worker:
+            self.worker.cancel()
+            for sig in (self.worker.progress, self.worker.batch_done, self.worker.failed):
+                try:
+                    sig.disconnect()
+                except Exception:
+                    pass
+        self._ui_idle()
+        self.status.setText("■ 중단했습니다.")
+
+    def _ui_idle(self):
+        self.timer.stop()
+        self.b_run.setEnabled(True)
+        self.b_stop.hide()
+
+    def _key(self, it):
+        car = self.db.agency_carrier(it["agency"])
+        extra = (car + "|" + ",".join(sn for sn, _ in it["src"]["data"]) + "|r:" +
+                 ",".join(sn for sn, _ in it["src"].get("rule_sheets", []))) if it["src"]["kind"] == "sheet" else car
+        extra += "|ex:" + ",".join(exclude_list(self.exclude.text())) + "|t:" + (self.tier.currentData() or "top")
+        return file_hash(it["path"], extra)
+
+    def run(self):
+        if staff_block(self, self.db, "정책 저장"):
+            return
+        self.db.set("exclude_words", self.exclude.text().strip())
+        _CURRENT_EXCLUDE[0] = self.exclude.text()
+        if not self.items:
+            return warn(self, "먼저 대리점 정책 파일을 올려주세요.")
+        miss = [it["name"] for it in self.items if not it["agency"]]
+        if miss:
+            return warn(self, "대리점이 정해지지 않은 파일이 있습니다. '대리점' 칸에서 골라주세요.\n\n" + "\n".join(miss))
+        key = self.db.get("api_key", "").strip()
+        cached, todo = {}, []
+        for i, it in enumerate(self.items):
+            it["hash"] = self._key(it)
+            row = self.db.one("SELECT data FROM ai_cache WHERE hash=?", (it["hash"],))
+            if row:
+                cached[i] = tuple(json.loads(row["data"]))
+                it["state"] = "✅ 전에 읽은 파일 (바로 적용)"
+            else:
+                todo.append((i, it["src"], self.db.agency_carrier(it["agency"])))
+                it["state"] = "⏳ 읽는 중"
+        if todo and not key:
+            return warn(self, "AI 키가 없습니다. ⚙ 설정에서 Claude·GPT·Gemini 키 중 하나를 넣어주세요.")
+        self.render()
+        self.b_run.setEnabled(False)
+        self.b_stop.show()
+        self.sec = 0
+        self.msg = f"🤖 {len(todo)}개 파일을 동시에 읽는 중…" if todo else "저장 중…"
+        self.timer.start(1000)
+        existing = sorted({p["model"] for p in self.db.effective_policies("9999-12-31")})
+        self.worker = BatchWorker(key, pick_model(key, self.db.get("ai_model", "")), todo, cached, existing)
+        self.worker.exclude = exclude_list(self.exclude.text())
+        self.worker.tier_mode = self.tier.currentData() or "top"
+        self.worker.progress.connect(lambda m: setattr(self, "msg", m))
+        self.worker.batch_done.connect(self._done)
+        self.worker.failed.connect(self._failed)
+        self.worker.start()
+
+    def _failed(self, msg):
+        self._ui_idle()
+        self.status.setText("❌ 읽기 실패")
+        warn(self, msg)
+
+    def _done(self, per):
+        self._ui_idle()
+        vf = dstr(self.date)
+        lines = []
+        all_changes = []
+        for i, it in enumerate(self.items):
+            rows, rules, notes, tr, exact = per.get(i, per.get(str(i), ([], [], [], False, 0)))
+            if rows:
+                self.db.x("INSERT OR REPLACE INTO ai_cache(hash, created, data) VALUES(?,?,?)",
+                          (it["hash"], now(), json.dumps([rows, rules, notes, tr, exact], ensure_ascii=False)))
+            ag = self.db.one("SELECT name, carrier FROM agencies WHERE id=?", (it["agency"],))
+            if not rows:
+                it["state"] = "❌ 정책을 못 찾음"
+                why = " / ".join(html.escape(str(n)) for n in notes if "해석 실패" in str(n) or "응답" in str(n))[:400]
+                lines.append(f"<b>{html.escape(ag['name'])}</b> ← {html.escape(it['name'])}: <span style='color:#d62828'>"
+                             f"정책을 못 찾았습니다</span> {why or '(시트 선택 확인 · ai_log 폴더에 AI 응답 기록 있음)'}")
+                continue
+            ins, same, ended, bad = save_policy_set(self.db, it["agency"], vf, rows, rules, end_missing=True)
+            archive_policy_file(self.db, it["path"], it["agency"], vf)
+            ups, downs, newn = policy_changes(self.db, it["agency"], vf)
+            ct = change_text(ups, downs)
+            if ct:
+                all_changes.append(f"{ag['name']}: {ct}")
+            neg = sum(1 for r in rows if to_int(r[7]) < 0)
+            it["state"] = f"✅ 저장 {len(rows)}줄"
+            lines.append(f"<b>{html.escape(ag['name'])} ({ag['carrier']})</b> ← {html.escape(it['name'])}: "
+                         f"정책 {len(rows)}줄 (원본 칸에서 정확히 {exact}줄) · 부가·차감 규칙 {len(rules)}개 · "
+                         f"새로/바뀜 {ins} · 종료 {ended}" + (f" · <span style='color:#b8860b'>마이너스 {neg}줄 확인</span>" if neg else "")
+                         + (" · ⚠ 표가 커서 일부 잘렸을 수 있음" if tr else "")
+                         + (f"<br>&nbsp;&nbsp;&nbsp;{html.escape(ct)}" if ct else "")
+                         + (f" · 🆕 새로 생긴 정책 {newn}줄" if newn and not ct else ""))
+        if all_changes:
+            self.db.set("last_changes", json.dumps(all_changes, ensure_ascii=False))
+            self.db.set("last_changes_date", vf)
+        self.render()
+        self.db.notify("policy")
+        self.result.setHtml("<br>".join(lines) + "<br><br>👉 이제 <b>📣 판매정책</b> 탭에서 우리 매장 판매정책을 만들고, "
+                            "<b>🏆 최적 대리점 · 📶 구간별 비교</b>에서 SK·KT·LG를 비교하세요. "
+                            "잘못 읽힌 대리점은 <b>📋 정책 입력</b>에서 그 대리점 → [현재 저장된 정책 불러오기]로 고칠 수 있습니다.")
+        self.status.setText(f"✅ 끝! ({self.sec // 60}분 {self.sec % 60:02d}초)")
+
+
+# ============================================================
+# 탭: 📣 우리 매장 판매정책 만들기 (SK·KT·LG 대리점 9곳 중 제일 좋은 조건으로) → 엑셀로 직원 배포
+# ============================================================
+SHOW_MODES = [("고객지원금(추가지원)", "sup"), ("할부원금(공시지원)", "hal"), ("할부원금(선택약정)", "sel"),
+              ("정산금(리베이트, 사장님용)", "net")]
+
+
+def clean_addon_name(name):
+    n = re.sub(r"\s*(미유치|유치|미가입|가입|미이용|차감|추가|시)\b", "", name or "").strip(" -·/")
+    return n or (name or "")
+
+
+ADDON_MAIN = ("부가", "필링", "보험")          # 손님이 가입하는 상품 (결합·카드는 따로)
+
+
+def short_name(n, k=24):
+    n = re.sub(r"\s+", " ", clean_addon_name(n)).strip()
+    return n if len(n) <= k else n[:k - 1] + "…"
+
+
+def addon_rows(db, date, kinds=ADDON_MAIN):
+    """통신사·상품별로 묶은 부가서비스 목록: [dict(carrier, name, memo, kind, ags=[(대리점, 하면, 안하면)])]"""
+    groups = {}
+    for a in db.agencies():
+        for r in db.effective_rules(date, a["id"]):
+            if r["kind"] not in kinds:
+                continue
+            nm = clean_addon_name(r["name"])
+            g = groups.setdefault((a["carrier"] or "?", nm), dict(carrier=a["carrier"] or "?", name=nm, kind=r["kind"],
+                                                                  memo=r["memo"] or "", ags=[]))
+            if not any(x[0] == a["name"] for x in g["ags"]):
+                g["ags"].append((a["name"], r["amt_yes"], r["amt_no"]))
+    rows = list(groups.values())
+    rows.sort(key=lambda g: (CARRIERS.index(g["carrier"]) if g["carrier"] in CARRIERS else 9,
+                             -max(abs(y) + abs(n) for _, y, n in g["ags"])))
+    return rows
+
+
+def addon_html(db, date, owner=True, per=8):
+    """카톡 이미지용: 통신사 3칸 나란히, 상품 이름만 (많이 영향 주는 순 최대 per개)"""
+    rows = addon_rows(db, date)
+    if not rows:
+        return ""
+    cars = [c for c in CARRIERS if any(r["carrier"] == c for r in rows)]
+    colc = {"SKT": "#E8412C", "KT": "#222222", "LGU+": "#C4006B"}
+    h = ["<table border='1' cellspacing='0' cellpadding='5'><tr><th colspan='%d' bgcolor='#fff4cc'>📌 가입 권유할 부가서비스</th></tr><tr>"
+         % len(cars)]
+    for c in cars:
+        h.append(f"<th bgcolor='{colc.get(c, '#555')}'><font color='white'>{c}</font></th>")
+    h.append("</tr><tr>")
+    for c in cars:
+        items = [r for r in rows if r["carrier"] == c][:per]
+        h.append("<td valign='top'>" + "<br>".join(f"• {html.escape(short_name(r['name']))}" for r in items) + "</td>")
+    h.append("</tr></table>")
+    return "".join(h)
+
+
+def addon_text_lines(db, date, per=10):
+    out = []
+    rows = addon_rows(db, date)
+    for c in CARRIERS:
+        items = [short_name(r["name"]) for r in rows if r["carrier"] == c][:per]
+        if items:
+            out.append(f"{c}: " + ", ".join(items))
+    return out
+
+
+class AddonPanel(QWidget):
+    """통신사별 부가서비스를 보기 좋게: SKT | KT | LGU+ 세 칸 나란히, 상품 한 줄씩 (자세한 조건은 마우스 올리면)"""
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+        self.date = today()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        top = QHBoxLayout()
+        self.title = QLabel("<b>📌 통신사별 부가서비스</b> (개통할 때 손님께 권유할 상품 · 영향 큰 순 · 마우스를 올리면 자세한 조건)")
+        self.more = QCheckBox("결합·카드 조건도 보기")
+        self.fold = QPushButton("접기 ▲")
+        self.fold.clicked.connect(self.toggle)
+        self.more.toggled.connect(lambda *_: self.fill())
+        top.addWidget(self.title)
+        top.addStretch()
+        top.addWidget(self.more)
+        top.addWidget(self.fold)
+        lay.addLayout(top)
+        self.boxes = QHBoxLayout()
+        self.lists = {}
+        for c in CARRIERS:
+            col = QVBoxLayout()
+            head = QLabel(f"<b style='color:white'>&nbsp;{c}&nbsp;</b>")
+            head.setStyleSheet(f"background:{ {'SKT': '#E8412C', 'KT': '#222222', 'LGU+': '#C4006B'}[c] };"
+                               "border-radius:4px;padding:3px")
+            lw = QListWidget()
+            lw.setMaximumHeight(150)
+            col.addWidget(head)
+            col.addWidget(lw)
+            self.boxes.addLayout(col)
+            self.lists[c] = lw
+        self.body = QWidget()
+        self.body.setLayout(self.boxes)
+        lay.addWidget(self.body)
+
+    def toggle(self):
+        v = not self.body.isVisible()
+        self.body.setVisible(v)
+        self.fold.setText("접기 ▲" if v else "펼치기 ▼")
+
+    def fill(self, date=None):
+        if date:
+            self.date = date
+        owner = not self.db.is_staff_pc()
+        kinds = ADDON_MAIN + (("결합", "카드") if self.more.isChecked() else ())
+        rows = addon_rows(self.db, self.date, kinds)
+        for c, lw in self.lists.items():
+            lw.clear()
+            items = [r for r in rows if r["carrier"] == c]
+            if not items:
+                lw.addItem("(없음)")
+            for r in items:
+                txt = short_name(r["name"], 26)
+                if owner:
+                    best = max(r["ags"], key=lambda x: abs(x[1]) + abs(x[2]))
+                    eff = best[1] - best[2]
+                    if eff:
+                        txt += f"   ({man(eff)})"
+                lw.addItem(txt)
+                it = lw.item(lw.count() - 1)
+                tip = [r["name"]]
+                if r["memo"]:
+                    tip.append("조건: " + r["memo"])
+                if owner:
+                    tip += [f"{ag}: 하면 {man(y) if y else '0'} / 안하면 {man(n) if n else '0'}" for ag, y, n in r["ags"]]
+                it.setToolTip("\n".join(tip))
+
+
+def build_store_policy(db, date, fee, join_list, flags, margin, unit, carriers=None, disc="공시"):
+    """→ {model: {(carrier, join): dict(best agency...)}}"""
+    pols = [p for p in db.visible_policies(date) if p["category"] == "무선" and fee_numbers(p["plan"])]
+    groups = {}
+    for p in pols:
+        if p["join_type"] not in join_list or (carriers and p["carrier"] not in carriers):
+            continue
+        groups.setdefault((p["model"], p["carrier"], p["join_type"], p["agency_id"]), []).append(p)
+    rules = {}
+    out = {}
+    rel = {}
+    for p in pols:                       # 출고가가 비어 있는 대리점('별도확인' 등)은 다른 대리점 출고가로
+        if p["release_price"]:
+            rel[p["model"]] = max(rel.get(p["model"], 0), p["release_price"])
+    for (model, car, join, aid), cands in groups.items():
+        if aid not in rules:
+            rules[aid] = db.effective_rules(date, aid)
+        for p in pick_by_fee(by_discount(cands, disc), fee):
+            if not fee_numbers(p["plan"]):
+                continue
+            adj, applied, warns = apply_rules(rules[aid], p, join, fee, flags)
+            net = p["rebate"] - p["deduction"] + adj
+            cell = out.setdefault(model, {}).get((car, join))
+            if cell is None or net > cell["net"]:
+                sup = max(0, net - margin)
+                if unit > 1:
+                    sup = sup // unit * unit
+                rp = p["release_price"] or rel.get(model, 0)
+                addons = []
+                for rr in rules[aid]:
+                    if rr["kind"] in ADDON_MAIN and flags.get(rr["kind"]) and rule_applies(rr, p, join, fee):
+                        nm = clean_addon_name(rr["name"])
+                        if nm not in addons:
+                            addons.append(nm)
+                out[model][(car, join)] = dict(addons=addons,
+                    net=net, agency=p["agency"], plan=p["plan"], sup=sup, applied=applied, warns=warns,
+                    release=rp, public=p["public_subsidy"],
+                    hal=max(0, rp - p["public_subsidy"] - sup), sel=max(0, rp - sup))
+    return out
+
+
+class StorePolicyTab(QWidget):
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+        self.data = {}
+        lay = QVBoxLayout(self)
+        lay.addWidget(banner("<b>우리 매장 판매정책</b>: 모델마다 SK·KT·LG 대리점 9곳 중 <b>제일 많이 주는 곳</b>을 골라, "
+                             "목표마진을 빼고 <b>손님에게 줄 지원금</b>을 계산합니다. 부가서비스·보험·요금제 차감까지 반영.<br>"
+                             "다 되면 <b>[📤 직원용 판매정책 엑셀]</b>로 뽑아서 카톡으로 뿌리세요 (리베이트·마진·대리점은 안 보임)."))
+        r1 = QHBoxLayout()
+        self.date = date_edit()
+        self.fee = QComboBox()
+        self.fee.setEditable(True)
+        self.margin = money_spin(0, 5_000_000)
+        self.unit = QComboBox()
+        for t, v in [("절사 없음", 1), ("천원 단위", 1000), ("만원 단위", 10000)]:
+            self.unit.addItem(t, v)
+        self.mode = QComboBox()
+        for t, v in SHOW_MODES:
+            self.mode.addItem(t, v)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("모델 검색")
+        for w in [QLabel("날짜"), self.date, QLabel(" 요금 구간(천원)"), self.fee, QLabel(" 목표마진"), self.margin,
+                  QLabel(" 지원금"), self.unit, QLabel(" 표에 보일 금액"), self.mode, self.search]:
+            r1.addWidget(w)
+        self.disc = discount_combo()
+        for w in [QLabel(" 할인"), self.disc]:
+            r1.addWidget(w)
+        r1.addStretch()
+        lay.addLayout(r1)
+        fb = QGroupBox("판매 기준 손님 조건 (보통 '부가·보험 가입'을 기준으로 정책을 만듭니다)")
+        fl = QVBoxLayout(fb)
+        self.flags = FlagBox(on_change=lambda: self.data and self.calc())
+        fl.addWidget(self.flags)
+        lay.addWidget(fb)
+        r2 = QHBoxLayout()
+        r2.addWidget(btn("📣 판매정책 만들기", self.calc, primary=True, big=True))
+        r2.addWidget(btn("📤 직원용 판매정책 엑셀", lambda: self.export(False), primary=True))
+        r2.addWidget(btn("🔒 사장님용 엑셀 (대리점·정산금 포함)", lambda: self.export(True)))
+        r2.addWidget(btn("🖼 카톡용 이미지", self.export_image, primary=True))
+        r2.addWidget(btn("🙈 선택 모델 숨기기", lambda: hide_selected(self, self.table, 0, self.calc)))
+        r2.addStretch()
+        lay.addLayout(r2)
+        self.summary = QLabel("")
+        self.summary.setWordWrap(True)
+        self.summary.setStyleSheet("font-weight:bold;color:#1a7f37")
+        lay.addWidget(self.summary)
+        self.addons = AddonPanel(db)
+        lay.addWidget(self.addons)
+        self.table = make_table(["모델"])
+        lay.addWidget(self.table, 1)
+        lay.addWidget(hint("칸 = 그 통신사 대리점 3곳 중 제일 좋은 곳 기준 금액. 초록 = 그 모델·가입유형에서 통신사 1등. "
+                           "칸에 마우스를 올리면 어느 대리점·어떤 요금 구간·어떤 조건이 적용됐는지 보입니다. "
+                           "'-' = 그 통신사 대리점에 그 모델 정책이 없음."))
+        self._init = False
+        self.mode.currentIndexChanged.connect(lambda *_: self.data and self.render())
+        self.search.returnPressed.connect(lambda: self.data and self.render())
+
+    def refresh(self):
+        fees = sorted({min(fee_numbers(p["plan"])) for p in self.db.visible_policies(dstr(self.date))
+                       if p["category"] == "무선" and fee_numbers(p["plan"])}, reverse=True)
+        cur = self.fee.currentText()
+        self.fee.blockSignals(True)
+        self.fee.clear()
+        self.fee.addItems([str(f) for f in fees] or ["115", "95", "69"])
+        self.fee.setCurrentText(cur if cur else (str(fees[0]) if fees else "115"))
+        self.fee.blockSignals(False)
+        if not self._init:
+            self._init = True
+            self.margin.setValue(to_int(self.db.get("target_margin", "100000")))
+            self.unit.setCurrentIndex(max(0, self.unit.findData(to_int(self.db.get("round_unit", "10000")))))
+
+    def calc(self):
+        fee = to_int(self.fee.currentText()) or 115
+        self.cur_fee = fee
+        self.data = build_store_policy(self.db, dstr(self.date), fee, JOIN_BY_CAT["무선"], self.flags.get(),
+                                       self.margin.value(), self.unit.currentData() or 1,
+                                       disc=self.disc.currentData())
+        if not self.data:
+            fill_table(self.table, [])
+            return warn(self, "정책이 없습니다. 먼저 📥 정책 일괄 등록에서 대리점 정책을 저장해 주세요.")
+        self.render()
+
+    def carriers(self):
+        cs = {c for m in self.data.values() for (c, _j) in m}
+        return sorted(cs, key=lambda c: CARRIERS.index(c) if c in CARRIERS else 9)
+
+    def render(self):
+        mode = self.mode.currentData()
+        cars = self.carriers()
+        joins = JOIN_BY_CAT["무선"]
+        short = {"신규": "신규", "번호이동": "번이", "기기변경": "기변"}
+        heads = ["모델"] + [f"{c} {short[j]}" for c in cars for j in joins] + ["비고 (1등 대리점 조건·가입할 부가서비스)"]
+        q = norm_model(self.search.text())
+        models = sorted((m for m in self.data if not q or q in norm_model(m)), key=model_sort_key)
+        self.table.setSortingEnabled(False)
+        self.table.setColumnCount(len(heads))
+        self.table.setHorizontalHeaderLabels(heads)
+        rows, cc = [], {}
+        wins = {c: 0 for c in cars}
+        for r, m in enumerate(models):
+            line = [m]
+            for j in joins:
+                best_c = max((c for c in cars if (c, j) in self.data[m]), key=lambda c: self.data[m][(c, j)]["net"],
+                             default=None)
+                if best_c:
+                    wins[best_c] += 1
+                    cc[(r, 1 + cars.index(best_c) * len(joins) + joins.index(j))] = GREEN
+            for c in cars:
+                for j in joins:
+                    d = self.data[m].get((c, j))
+                    if not d:
+                        line.append(txt_item("-"))
+                        continue
+                    v = d[mode]
+                    it = NumItem(v, f"{v / 10000:g}만")
+                    it.setToolTip(f"{d['agency']} · {d['plan']}\n정산금 {won(d['net'])}원 → 고객지원금 {won(d['sup'])}원\n"
+                                  + ("\n".join(d["applied"]) if d["applied"] else "조건 가감 없음")
+                                  + (f"\n⚠ {' / '.join(d['warns'])}" if d["warns"] else ""))
+                    line.append(it)
+            line.append(self.note(m, cars, owner=not self.db.is_staff_pc()))
+            rows.append(line)
+        fill_table(self.table, rows, cell_colors=cc)
+        for c in range(1, len(heads) - 1):
+            self.table.setColumnWidth(c, 66)
+        self.addons.fill(dstr(self.date))
+        self.summary.setText(f"📣 {self.cur_fee}요금 기준 · 모델 {len(models)}개 · 목표마진 {won(self.margin.value())}원   |   "
+                             "1등 칸 수: " + "  ".join(f"{c} {wins[c]}" for c in cars))
+
+    def note(self, m, cars, owner=True):
+        """비고: 통신사마다 (번이 기준 1등 대리점의) 가입해야 할 부가서비스와 주의사항"""
+        parts = []
+        for c in cars:
+            d = self.data[m].get((c, "번호이동")) or next((self.data[m][(cc, j)] for (cc, j) in self.data[m] if cc == c), None)
+            if not d:
+                continue
+            bits = []
+            if d.get("addons"):
+                ad = [short_name(x, 16) for x in d["addons"]]
+                bits.append("부가: " + ", ".join(ad[:3]) + (f" 외 {len(ad) - 3}" if len(ad) > 3 else ""))
+            if owner and d.get("warns"):
+                bits.append(f"⚠ 주의 {len(d['warns'])}건")
+            if bits:
+                parts.append(f"{c}{'(' + d['agency'] + ')' if owner else ''} " + " · ".join(bits))
+        return "  |  ".join(parts) or "-"
+
+    def export_image(self):
+        if not self.data:
+            self.calc()
+            if not self.data:
+                return
+        store = html.escape(self.db.get("store_name", "우리매장"))
+        cars = self.carriers()
+        joins = JOIN_BY_CAT["무선"]
+        short = {"신규": "신규", "번호이동": "번이", "기기변경": "기변"}
+        colc = {"SKT": "#E8412C", "KT": "#222222", "LGU+": "#C4006B"}
+        flag_txt = ", ".join(lab for k, lab in FLAGS if self.flags.get().get(k)) or "부가 조건 없음"
+        h = [f"<h2 style='color:#1f3a5f'>{store} 판매정책</h2>",
+             f"<p style='color:#555'>{dstr(self.date)} · 요금 {self.cur_fee}천원 구간 · {self.disc.currentText()} · "
+             f"기준: {html.escape(flag_txt)} · 금액: 고객지원금(만원)</p>",
+             addon_html(self.db, dstr(self.date), owner=False), "<br>",
+             "<table border='1' cellspacing='0' cellpadding='5' style='border-collapse:collapse'>",
+             "<tr><th rowspan='2' bgcolor='#1f3a5f'><font color='white'>모델</font></th>"]
+        for c in cars:
+            h.append(f"<th colspan='3' bgcolor='{colc.get(c, '#555')}'><font color='white'>{c}</font></th>")
+        h[-1] = h[-1]      # (모델 열 머리글 유지)
+        h.append("<th rowspan='2' bgcolor='#1f3a5f'><font color='white'>비고 (가입할 부가서비스)</font></th>")
+        h.append("</tr><tr>" + "".join(f"<th bgcolor='#eef1f5'>{short[j]}</th>" for _ in cars for j in joins) + "</tr>")
+        for m in sorted(self.data, key=model_sort_key):
+            row = [f"<td><b>{html.escape(m)}</b></td>"]
+            best = {}
+            for j in joins:
+                cand = [c for c in cars if (c, j) in self.data[m]]
+                if cand:
+                    best[j] = max(cand, key=lambda c: self.data[m][(c, j)]["net"])
+            for c in cars:
+                for j in joins:
+                    d = self.data[m].get((c, j))
+                    if not d:
+                        row.append("<td align='center'>-</td>")
+                    elif best.get(j) == c:
+                        row.append(f"<td align='center' bgcolor='#d8f3df'><b><font color='#1a7f37'>{d['sup'] / 10000:g}</font></b></td>")
+                    else:
+                        row.append(f"<td align='center'>{d['sup'] / 10000:g}</td>")
+            row.append(f"<td><font size='2'>{html.escape(self.note(m, cars, owner=False))}</font></td>")
+            h.append("<tr>" + "".join(row) + "</tr>")
+        h.append("</table><p style='color:#777'>초록 = 그 가입유형 최고 통신사 · 공시지원금·할부원금은 매장 문의</p>")
+        path = os.path.join(desktop_dir(), f"판매정책_{dstr(self.date)}_{self.cur_fee}.png")
+        html_to_png("".join(h), 560 + 70 * 3 * len(cars), path)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        info(self, f"✅ 카톡용 이미지를 만들었습니다.\n{path}\n\n카톡 단톡방에 이 사진을 올리면 됩니다.")
+
+    def export(self, owner):
+        if not self.data:
+            self.calc()
+            if not self.data:
+                return
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            return warn(self, "엑셀 저장 구성요소(openpyxl)가 없습니다. 설치 bat을 다시 실행해 주세요.")
+        fees = sorted({to_int(self.fee.itemText(i)) for i in range(self.fee.count())}, reverse=True)
+        choice, ok = QInputDialog.getItem(self, "엑셀 만들기", "어떤 요금 구간으로 만들까요?",
+                                          [f"지금 구간만 ({self.cur_fee})", f"모든 구간 ({len(fees)}개 시트)"], 0, False)
+        if not ok:
+            return
+        fee_list = fees if choice.startswith("모든") else [self.cur_fee]
+        store = self.db.get("store_name", "우리매장")
+        date = dstr(self.date)
+        name = f"{store}_판매정책_{date}{'_사장님용' if owner else ''}.xlsx"
+        path, _ = QFileDialog.getSaveFileName(self, "판매정책 엑셀 저장", os.path.join(os.path.expanduser("~"), "Desktop", name),
+                                              "엑셀 (*.xlsx)")
+        if not path:
+            return
+        wb = openpyxl.Workbook()
+        wb.remove(wb.active)
+        thin = Side(style="thin", color="C8CED6")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        hfill = {"SKT": "E8412C", "KT": "1F1F1F", "LGU+": "C4006B"}
+        cars_all = set()
+        for fee in fee_list:
+            data = build_store_policy(self.db, date, fee, JOIN_BY_CAT["무선"], self.flags.get(), self.margin.value(),
+                                      self.unit.currentData() or 1, disc=self.disc.currentData())
+            cars = sorted({c for m in data.values() for (c, _j) in m}, key=lambda c: CARRIERS.index(c) if c in CARRIERS else 9)
+            cars_all |= set(cars)
+            ws = wb.create_sheet(f"{fee}요금")
+            cols_per = 4 if owner else 3
+            ws.cell(1, 1, f"{store} 판매정책  ·  {date}  ·  요금 {fee}천원 구간  ·  금액 단위: 만원").font = Font(bold=True, size=14)
+            flag_txt = ", ".join(lab for k, lab in FLAGS if self.flags.get().get(k)) or "부가·보험 조건 없음"
+            ws.cell(2, 1, f"기준: {flag_txt}  /  고객지원금 = 추가지원금(공시지원금 별도)"
+                          + ("  /  ※ 사장님용: 대리점·정산금 포함 — 외부 유출 금지" if owner else "")).font = Font(color="666666")
+            ws.cell(3, 1, "모델").font = Font(bold=True, color="FFFFFF")
+            ws.cell(3, 1).fill = PatternFill("solid", fgColor="1F3A5F")
+            ws.merge_cells(start_row=3, start_column=1, end_row=4, end_column=1)
+            col = 2
+            for c in cars:
+                span = 3 * (2 if owner else 1)
+                ws.cell(3, col, c).font = Font(bold=True, color="FFFFFF")
+                ws.cell(3, col).fill = PatternFill("solid", fgColor=hfill.get(c, "555555"))
+                ws.cell(3, col).alignment = Alignment(horizontal="center")
+                ws.merge_cells(start_row=3, start_column=col, end_row=3, end_column=col + span - 1)
+                for j in JOIN_BY_CAT["무선"]:
+                    labs = [j] if not owner else [f"{j} 지원금", f"{j} 대리점/정산"]
+                    for lab in labs:
+                        ws.cell(4, col, lab).font = Font(bold=True)
+                        ws.cell(4, col).fill = PatternFill("solid", fgColor="EEF1F5")
+                        ws.cell(4, col).alignment = Alignment(horizontal="center", wrap_text=True)
+                        col += 1
+            r = 5
+            for m in sorted(data, key=model_sort_key):
+                ws.cell(r, 1, m).font = Font(bold=True)
+                col = 2
+                best = {}
+                for j in JOIN_BY_CAT["무선"]:
+                    cand = [c for c in cars if (c, j) in data[m]]
+                    if cand:
+                        best[j] = max(cand, key=lambda c: data[m][(c, j)]["net"])
+                for c in cars:
+                    for j in JOIN_BY_CAT["무선"]:
+                        d = data[m].get((c, j))
+                        cell = ws.cell(r, col, round(d["sup"] / 10000, 1) if d else "-")
+                        cell.alignment = Alignment(horizontal="center")
+                        if d and best.get(j) == c:
+                            cell.fill = PatternFill("solid", fgColor="D8F3DF")
+                            cell.font = Font(bold=True, color="1A7F37")
+                        col += 1
+                        if owner:
+                            ws.cell(r, col, f"{d['agency']} / {d['net'] / 10000:g}" if d else "-").alignment = \
+                                Alignment(horizontal="center")
+                            col += 1
+                self_data, self.data = self.data, data
+                ws.cell(r, col, self.note(m, cars, owner=owner))
+                self.data = self_data
+                note_col = col
+                r += 1
+            for row in ws.iter_rows(min_row=3, max_row=r - 1, max_col=col - 1):
+                for cell in row:
+                    cell.border = border
+            ws.column_dimensions["A"].width = 30
+            for ci in range(2, col):
+                ws.column_dimensions[get_column_letter(ci)].width = 16 if owner else 9
+            ws.cell(3, col, "비고 (가입할 부가서비스)").font = Font(bold=True)
+            ws.column_dimensions[get_column_letter(col)].width = 60
+            ws.freeze_panes = "B5"
+            ws.cell(r + 1, 1, "초록 = 그 가입유형에서 가장 좋은 통신사. 공시지원금·할부원금은 매장 문의.").font = Font(color="666666")
+            ws.cell(r + 3, 1, "📌 통신사별 부가서비스 안내").font = Font(bold=True, size=12)
+            rr = r + 4
+            for ln in addon_text_lines(self.db, date):
+                ws.cell(rr, 1, ln)
+                rr += 1
+        wb.save(path)
+        extra = ""
+        d = self.db.get("share_dir", "")
+        if not owner and d and os.path.isdir(d):
+            shutil.copyfile(path, os.path.join(d, os.path.basename(path)))
+            extra = "\n공유 폴더에도 복사했습니다."
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        info(self, f"✅ 엑셀을 만들었습니다.\n{path}{extra}\n\n" +
+             ("이 파일은 대리점·정산금이 들어 있으니 직원에게 보내지 마세요." if owner
+              else "이 파일을 카톡으로 직원들에게 보내면 됩니다. (리베이트·마진·대리점은 안 들어 있음)"))
 
 
 # ============================================================
@@ -2693,7 +5012,7 @@ class CompareTab(QWidget):
         q = self.search.text().strip().lower()
         ags = [a["name"] for a in self.db.agencies(car)]
         data = {}
-        for p in self.db.effective_policies(dstr(self.date)):
+        for p in self.db.visible_policies(dstr(self.date)):
             if p["category"] != cat or p["carrier"] != car:
                 continue
             if jt != "전체" and p["join_type"] != jt:
@@ -2752,6 +5071,7 @@ class HistoryTab(QWidget):
             top.addWidget(w)
         top.addWidget(btn("조회", self.calc, primary=True))
         top.addWidget(btn("엑셀로 내보내기", lambda: export_csv(self, self.table, "정책이력.csv")))
+        top.addWidget(btn("🗂 정책 원본 보관함", lambda: ArchiveDialog(self, self.db).exec()))
         top.addStretch()
         lay.addLayout(top)
         self.table = make_table(self.HEAD)
@@ -2876,6 +5196,9 @@ class BestTab(QWidget):
         for w in [QLabel("날짜"), self.date, QLabel(" 구분"), self.cat, QLabel(" 통신사"), self.carrier,
                   QLabel(" 모델"), self.model, QLabel(" 요금제(천원)"), self.fee, QLabel(" 가입유형"), self.join]:
             r1.addWidget(w)
+        self.disc = discount_combo()
+        for w in [QLabel(" 할인"), self.disc]:
+            r1.addWidget(w)
         r1.addStretch()
         lay.addLayout(r1)
         fb = QGroupBox("손님 조건 (해당하는 것만 체크)")
@@ -2922,7 +5245,7 @@ class BestTab(QWidget):
         cat = self.cat.currentText()
         car = self.carrier.currentText()
         names = {}
-        for p in self.db.effective_policies(dstr(self.date)):
+        for p in self.db.visible_policies(dstr(self.date)):
             if p["category"] != cat or (car not in ("", "전체") and p["carrier"] != car):
                 continue
             k = norm_model(p["model"])
@@ -2953,7 +5276,7 @@ class BestTab(QWidget):
         target = to_int(self.db.get("target_margin", "100000"))
         unit = to_int(self.db.get("round_unit", "10000")) or 1
         groups = {}
-        for p in self.db.effective_policies(date):
+        for p in self.db.visible_policies(date):
             if p["category"] != cat or p["join_type"] != join:
                 continue
             if car not in ("", "전체") and p["carrier"] != car:
@@ -2966,7 +5289,7 @@ class BestTab(QWidget):
         for (aid, mk), cands in groups.items():
             if aid not in rules_cache:
                 rules_cache[aid] = self.db.effective_rules(date, aid)
-            for p in pick_by_fee(cands, fee):
+            for p in pick_by_fee(by_discount(cands, self.disc.currentData()), fee):
                 use_fee = fee if fee is not None else plan_fee(p["plan"])
                 adj, applied, warns = apply_rules(rules_cache[aid], p, join, use_fee, flags)
                 net = p["rebate"] - p["deduction"] + adj
@@ -3003,8 +5326,16 @@ class BestTab(QWidget):
         msg = f"🏆 1등: {best[0]['p']['agency']} — 실제 받는 돈 {won(best[0]['net'])}원"
         if len(best) > 1:
             msg += f"  (2등 {best[1]['p']['agency']}보다 {won(best[0]['net'] - best[1]['net'])}원 더)"
+        per_car = {}
+        for r in best:
+            c = r["p"]["carrier"]
+            if c not in per_car:
+                per_car[c] = r
+        msg += "\n📡 통신사별 최고:  " + "   |   ".join(
+            f"{c} {per_car[c]['p']['agency']} {per_car[c]['net'] / 10000:g}만"
+            for c in sorted(per_car, key=lambda c: CARRIERS.index(c) if c in CARRIERS else 9))
         if len(order) > 1:
-            msg += f"   ※ 검색에 모델 {len(order)}개가 걸렸습니다. 모델별로 순위를 따로 매겼어요."
+            msg += f"\n※ 검색에 모델 {len(order)}개가 걸렸습니다. 모델별로 순위를 따로 매겼어요."
         self.summary.setText(msg)
 
     def register(self):
@@ -3016,6 +5347,200 @@ class BestTab(QWidget):
         if self.on_register:
             self.on_register(dict(date=dstr(self.date), agency_id=p["agency_id"], category=p["category"],
                                   model=p["model"], plan=p["plan"], join=p["join_type"], flags=self.flags.get()))
+
+
+# ============================================================
+# 탭: 요금제 구간별 비교 (통신사·대리점 × 요금 구간)
+# ============================================================
+DEFAULT_FEES = "115,105,95,85,75,69,61,55,44,33"
+
+
+class TierTab(QWidget):
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+        self.shown = False
+        lay = QVBoxLayout(self)
+        lay.addWidget(banner("<b>한 모델을 요금제 구간별로</b> 대리점·통신사끼리 비교합니다. 통신사마다 요금제 이름이 달라도 "
+                             "<b>월 요금(천원) 기준</b>으로 맞춰서 비교해요. 칸 = 부가·차감 조건까지 반영한 <b>실제 받는 돈</b>, "
+                             "초록 = 그 요금 구간 1등. 칸에 마우스를 올리면 어떤 요금제 구간·조건이 적용됐는지 보입니다."))
+        r1 = QHBoxLayout()
+        self.date = date_edit()
+        self.carrier = QComboBox()
+        self.model = QComboBox()
+        self.model.setEditable(True)
+        self.model.setMinimumWidth(260)
+        self.model.lineEdit().setPlaceholderText("모델 선택 (예: S26 256)")
+        self.join = QComboBox()
+        self.join.addItems(JOIN_BY_CAT["무선"])
+        self.join.setCurrentText("번호이동")
+        self.fees = QLineEdit("자동")
+        self.fees.setToolTip("'자동' = SK·KT·LG 정책표에 있는 요금 구간을 모아서 자동으로 칸을 만듦.\n"
+                             "직접 정하려면 월 요금(천원)을 쉼표로. 예: 115,95,69,55")
+        self.fees.setMinimumWidth(230)
+        for w in [QLabel("날짜"), self.date, QLabel(" 통신사"), self.carrier, QLabel(" 모델"), self.model,
+                  QLabel(" 가입유형"), self.join, QLabel(" 요금(천원)"), self.fees]:
+            r1.addWidget(w)
+        self.disc = discount_combo()
+        for w in [QLabel(" 할인"), self.disc]:
+            r1.addWidget(w)
+        r1.addStretch()
+        lay.addLayout(r1)
+        fb = QGroupBox("손님 조건 (해당하는 것만 체크)")
+        fl = QVBoxLayout(fb)
+        self.flags = FlagBox(on_change=lambda: self.shown and self.calc())
+        fl.addWidget(self.flags)
+        lay.addWidget(fb)
+        r2 = QHBoxLayout()
+        r2.addWidget(btn("📶 구간별 비교하기", self.calc, primary=True, big=True))
+        r2.addWidget(btn("엑셀로 내보내기", lambda: export_csv(self, self.table, f"구간비교_{dstr(self.date)}.csv")))
+        r2.addStretch()
+        lay.addLayout(r2)
+        self.summary = QLabel("")
+        self.summary.setWordWrap(True)
+        self.summary.setStyleSheet("font-size:11pt;font-weight:bold;color:#1a7f37;padding:4px")
+        lay.addWidget(self.summary)
+        self.table = make_table(["대리점", "통신사"])
+        lay.addWidget(self.table, 1)
+        lay.addWidget(hint("요금 구간 맞추기: 손님 요금이 정확히 있는 구간이 있으면 그 구간, 없으면 그보다 낮은 구간 중 가장 높은 구간 기준. "
+                           "'-' = 그 대리점에 이 모델·가입유형 정책이 없음. 아래 굵은 줄 = 통신사별 최고 금액."))
+        self.carrier.currentIndexChanged.connect(lambda *_: self._fill_models())
+        self.date.dateChanged.connect(lambda *_: self._fill_models())
+        self.join.currentIndexChanged.connect(lambda *_: self.shown and self.calc())
+        self.model.lineEdit().returnPressed.connect(self.calc)
+
+    def refresh(self):
+        fill_text_combo(self.carrier, ["전체"] + self.db.carriers())
+        self._fill_models()
+
+    def _fill_models(self):
+        car = self.carrier.currentText()
+        names = {}
+        for p in self.db.visible_policies(dstr(self.date)):
+            if p["category"] != "무선" or (car not in ("", "전체") and p["carrier"] != car):
+                continue
+            if not fee_numbers(p["plan"]):
+                continue
+            k = norm_model(p["model"])
+            if k and (k not in names or len(p["model"]) < len(names[k])):
+                names[k] = p["model"]
+        cur = self.model.currentText()
+        self.model.blockSignals(True)
+        self.model.clear()
+        for k, n in sorted(names.items(), key=lambda x: x[1]):
+            self.model.addItem(n, k)
+        self.model.setCurrentIndex(-1)
+        self.model.setEditText(cur)
+        self.model.blockSignals(False)
+
+    def calc(self):
+        date, car, join = dstr(self.date), self.carrier.currentText(), self.join.currentText()
+        fees = [int(x) for x in re.findall(r"\d+", self.fees.text())]
+        typed = self.model.currentText().strip()
+        idx = self.model.findText(typed)
+        key = self.model.itemData(idx) if idx >= 0 else None
+        q = norm_model(typed)
+        if not q:
+            return warn(self, "모델을 고르세요.")
+        pols = [p for p in self.db.visible_policies(date)
+                if p["category"] == "무선" and p["join_type"] == join
+                and (car in ("", "전체") or p["carrier"] == car) and fee_numbers(p["plan"])]
+        if not key:
+            keys = {norm_model(p["model"]) for p in pols if q in norm_model(p["model"])}
+            if len(keys) > 1:
+                names = sorted({p["model"] for p in pols if norm_model(p["model"]) in keys})[:8]
+                return warn(self, "검색에 모델이 여러 개 걸렸습니다. 목록에서 하나를 골라주세요.\n\n" + "\n".join(names))
+            key = next(iter(keys), None)
+        pols = [p for p in pols if norm_model(p["model"]) == key]
+        if not fees:     # 자동: 모든 통신사 정책표의 요금 구간을 모아서 칸 만들기 (SK·KT·LG 이름이 달라도 월 요금으로)
+            fees = sorted({min(fee_numbers(p["plan"])) for p in pols if fee_numbers(p["plan"])}, reverse=True)[:14] \
+                or [int(x) for x in DEFAULT_FEES.split(",")]
+        if not pols:
+            fill_table(self.table, [])
+            self.summary.setText("")
+            return warn(self, "이 모델·가입유형의 정책이 없습니다.")
+        flags = self.flags.get()
+        by_ag, rules = {}, {}
+        for p in pols:
+            by_ag.setdefault((p["agency_id"], p["agency"], p["carrier"]), []).append(p)
+        order = sorted(by_ag, key=lambda k: (CARRIERS.index(k[2]) if k[2] in CARRIERS else 9, k[1]))
+        grid, tips = [], []
+        for (aid, name, carrier) in order:
+            if aid not in rules:
+                rules[aid] = self.db.effective_rules(date, aid)
+            row, tip, first_best = [], [], None
+            for fee in fees:
+                best = None
+                for p in pick_by_fee(by_discount(by_ag[(aid, name, carrier)], self.disc.currentData()), fee):
+                    if not fee_numbers(p["plan"]):
+                        continue
+                    adj, applied, warns = apply_rules(rules[aid], p, join, fee, flags)
+                    net = p["rebate"] - p["deduction"] + adj
+                    if best is None or net > best[0]:
+                        best = (net, p["plan"], applied, warns)
+                row.append(best[0] if best else None)
+                if best and first_best is None:
+                    first_best = best
+                tip.append(f"{best[1]}\n" + ("\n".join(best[2]) if best[2] else "조건 가감 없음") +
+                           (f"\n⚠ {' / '.join(best[3])}" if best[3] else "") if best else "정책 없음")
+            note = "-"
+            if first_best:
+                bits = [re.sub(r"\s*\[.*?\]", "", first_best[1])]
+                if first_best[2]:
+                    bits.append("적용: " + ", ".join(short_name(x, 18) for x in first_best[2][:3]))
+                ads = [short_name(clean_addon_name(r["name"]), 14) for r in rules[aid] if r["kind"] in ADDON_MAIN]
+                if ads:
+                    bits.append("부가: " + ", ".join(list(dict.fromkeys(ads))[:3]))
+                if first_best[3]:
+                    bits.append(f"⚠ 주의 {len(first_best[3])}건")
+                note = " · ".join(bits)
+            grid.append((name, carrier, row, note))
+            tips.append(tip)
+        # 통신사별 최고 줄
+        carriers = sorted({c for _, c, _, _ in grid}, key=lambda c: CARRIERS.index(c) if c in CARRIERS else 9)
+        top_rows = []
+        for c in carriers:
+            vals, who = [], []
+            for j in range(len(fees)):
+                xs = [(r[j], n) for n, cc, r, _ in grid if cc == c and r[j] is not None]
+                vals.append(max(xs)[0] if xs else None)
+                if xs:
+                    who.append(max(xs)[1])
+            wn = list(dict.fromkeys(who))
+            top_rows.append((f"【{c} 최고】", c, vals, ("모든 구간 " + wn[0]) if len(wn) == 1 else " / ".join(wn[:3])))
+        heads = ["대리점", "통신사"] + [f"{f}요금" for f in fees] + ["비고 (적용 요금제 · 조건 · 부가서비스)"]
+        self.table.setSortingEnabled(False)
+        self.table.setColumnCount(len(heads))
+        self.table.setHorizontalHeaderLabels(heads)
+        data, cc = [], {}
+        col_max = [max([r[j] for _, _, r, _ in grid if r[j] is not None] or [None], key=lambda v: -10**12 if v is None else v)
+                   for j in range(len(fees))]
+        for i, (name, carrier, row, note) in enumerate(grid + top_rows):
+            line = [name, carrier]
+            for j, v in enumerate(row):
+                if v is None:
+                    it = txt_item("-")
+                else:
+                    it = NumItem(v, f"{v / 10000:g}만")
+                    if i < len(grid):
+                        it.setToolTip(tips[i][j])
+                    if v == col_max[j] and len(grid) > 1:
+                        cc[(i, 2 + j)] = GREEN
+                    elif v < 0:
+                        cc[(i, 2 + j)] = RED
+                line.append(it)
+            line.append(note)
+            data.append(line)
+        fill_table(self.table, data, cell_colors=cc, bold_rows=set(range(len(grid), len(data))))
+        self.shown = True
+        model_name = min((p["model"] for p in pols), key=len)
+        parts = []
+        for j, f in enumerate(fees[:5]):
+            if col_max[j] is None:
+                continue
+            winners = [n for n, _, r, _ in grid if r[j] == col_max[j]]
+            parts.append(f"{f}요금 → {winners[0]} {col_max[j] / 10000:g}만")
+        self.summary.setText(f"📶 {model_name} · {join}   |   " + "   ·   ".join(parts))
 
 
 # ============================================================
@@ -3061,6 +5586,11 @@ class SalesTab(QWidget):
         self.f_phone4.setMaxLength(4)
         self.f_phone4.setPlaceholderText("1234")
         self.f_memo = QLineEdit()
+        self.f_phone = QLineEdit()
+        self.f_phone.setPlaceholderText("010-0000-0000 (알림 문자용, 선택)")
+        self.f_months = QComboBox()
+        for t, v in (("24개월", 24), ("36개월", 36), ("12개월", 12), ("30개월", 30), ("일시불", 0)):
+            self.f_months.addItem(t, v)
         self.f_release = money_spin()
         self.f_public = money_spin()
         self.f_rebate = money_spin()
@@ -3082,15 +5612,16 @@ class SalesTab(QWidget):
             [("출고가", self.f_release), ("공시지원금", self.f_public), ("리베이트", self.f_rebate), ("차감", self.f_deduct)],
             [("부가·차감 가감", self.f_adjust), ("고객지원금/사은품", self.f_support),
              ("기타수입(중고 등)", self.f_extra), ("마진", self.lbl_margin)],
+            [("고객 연락처", self.f_phone), ("할부", self.f_months)],
         ]
         for r, row in enumerate(grid):
             for c, (label, w) in enumerate(row):
                 g.addWidget(QLabel(label), r, c * 2)
                 g.addWidget(w, r, c * 2 + 1, 1, 1)
-        g.addWidget(QLabel("손님 조건"), 5, 0)
-        g.addWidget(self.f_flags, 5, 1, 1, 7)
+        g.addWidget(QLabel("손님 조건"), 6, 0)
+        g.addWidget(self.f_flags, 6, 1, 1, 7)
         self.lbl_policy.setWordWrap(True)
-        g.addWidget(self.lbl_policy, 6, 0, 1, 8)
+        g.addWidget(self.lbl_policy, 7, 0, 1, 8)
         bar = QHBoxLayout()
         bar.addWidget(btn("정책 다시 불러오기", lambda: self.load_policy(False)))
         bar.addWidget(btn("지원금 = 목표마진 기준으로", self.auto_support))
@@ -3098,7 +5629,7 @@ class SalesTab(QWidget):
         bar.addWidget(btn("새로 입력", self.reset_form))
         self.b_save = btn("등록", self.save, primary=True, big=True)
         bar.addWidget(self.b_save)
-        g.addLayout(bar, 7, 0, 1, 8)
+        g.addLayout(bar, 8, 0, 1, 8)
         lay.addWidget(box)
 
         lst = QHBoxLayout()
@@ -3236,6 +5767,9 @@ class SalesTab(QWidget):
         if self.f_cat.currentText() == "무선":
             hal = max(0, self.f_release.value() - self.f_public.value() - self.f_support.value())
             extra = f"  <span style='font-size:10pt;color:#555'>(손님 할부원금 {won(hal)} 원)</span>"
+        target = to_int(self.db.get("target_margin", "100000"))
+        if m < target:
+            extra += f"  <span style='color:#d62828;font-size:10pt'>⚠ 목표마진보다 {won(target - m)}원 적음</span>"
         self.lbl_margin.setText(f"<span style='color:{color}'>{won(m)} 원</span>{extra}")
 
     def reset_form(self):
@@ -3244,6 +5778,7 @@ class SalesTab(QWidget):
         for w in (self.f_customer, self.f_phone4, self.f_memo):
             w.clear()
         self.f_extra.setValue(0)
+        self.f_phone.clear()
         self.f_flags.set({})
         self.lbl_policy.setText("")
         self.try_load()
@@ -3254,6 +5789,10 @@ class SalesTab(QWidget):
         if not aid or not model:
             return warn(self, "대리점과 모델/상품은 꼭 넣어주세요.")
         wired = self.f_cat.currentText() == "유선"
+        target = to_int(self.db.get("target_margin", "100000"))
+        if self.calc_margin() < target and not ask(
+                self, f"⚠ 이 개통은 마진이 {won(self.calc_margin())}원으로 목표마진({won(target)}원)보다 적습니다.\n그래도 등록할까요?"):
+            return
         vals = dict(
             sale_date=dstr(self.f_date), staff_id=self.f_staff.currentData(), agency_id=aid,
             category=self.f_cat.currentText(), carrier=self._carrier(), model=model,
@@ -3263,14 +5802,22 @@ class SalesTab(QWidget):
             release_price=self.f_release.value(), public_subsidy=self.f_public.value(),
             rebate=self.f_rebate.value(), deduction=self.f_deduct.value(), support=self.f_support.value(),
             extra_income=self.f_extra.value(), margin=self.calc_margin(), memo=self.f_memo.text().strip(),
-            adjust=self.f_adjust.value(), flags=self.f_flags.text())
+            adjust=self.f_adjust.value(), flags=self.f_flags.text(),
+            phone=self.f_phone.text().strip(), months=self.f_months.currentData())
+        if not vals["phone4"] and vals["phone"]:
+            vals["phone4"] = last4(vals["phone"])
         if self.editing_id:
             sets = ",".join(f"{k}=?" for k in vals)
             self.db.x(f"UPDATE sales SET {sets} WHERE id=?", (*vals.values(), self.editing_id))
+            sid = self.editing_id
         else:
             vals["created_at"] = now()
-            self.db.x(f"INSERT INTO sales({','.join(vals)}) VALUES({','.join('?' * len(vals))})",
-                      tuple(vals.values()))
+            sid = self.db.x(f"INSERT INTO sales({','.join(vals)}) VALUES({','.join('?' * len(vals))})",
+                            tuple(vals.values()))
+        try:
+            sync_terms(self.db, sid)
+        except Exception:
+            pass
         self.month.setDate(self.f_date.date())
         self.reset_form()
         self.load_list()
@@ -3305,6 +5852,8 @@ class SalesTab(QWidget):
                          (self.f_support, "support"), (self.f_extra, "extra_income")):
                 w.setValue(s[f] or 0)
             self.f_flags.set(s["flags"] or "")
+            self.f_phone.setText(s["phone"] or "")
+            self.f_months.setCurrentIndex(max(0, self.f_months.findData(s["months"] if s["months"] is not None else 24)))
         finally:
             self.lock = False
         self.editing_id = sid
@@ -3841,14 +6390,26 @@ class SettingsTab(QWidget):
         self.a_table = make_table(["대리점 이름", "통신사", "담당자/연락처", "메모"], editable=True)
         al.addWidget(self.a_table)
         b = QHBoxLayout()
-        b.addWidget(btn("➕ 대리점 추가", self.add_agency))
-        b.addWidget(btn("선택 삭제", self.del_agency))
-        b.addWidget(btn("💾 대리점 저장", self.save_agencies, primary=True))
+        self.ag_btns = [btn("➕ 대리점 추가", self.add_agency), btn("선택 삭제", self.del_agency),
+                        btn("💾 대리점 저장", self.save_agencies, primary=True)]
+        for x in self.ag_btns:
+            b.addWidget(x)
         b.addStretch()
         al.addLayout(b)
         lay.addWidget(agbox, 1)
 
+        # 직원 PC에 보이는 간단한 업데이트 안내 (토큰·배포 버튼 없음)
+        self.staff_box = QGroupBox("🌐 자동 업데이트")
+        stl = QHBoxLayout(self.staff_box)
+        self.staff_upd_lbl = QLabel("")
+        stl.addWidget(self.staff_upd_lbl)
+        stl.addStretch()
+        stl.addWidget(btn("🔄 새 버전 확인", self.check_github))
+        stl.addWidget(btn("🔒 사장님 PC로 전환", self.become_owner))
+        lay.addWidget(self.staff_box)
+
         gbox = QGroupBox("🌐 인터넷 자동 업데이트 (GitHub) — 카카오톡처럼 직원 PC에 업데이트 창")
+        self.gbox = gbox
         gg = QGridLayout(gbox)
         self.gh_repo = QLineEdit()
         self.gh_repo.setPlaceholderText("GitHub아이디/저장소이름   예: yeogida/phone-policy")
@@ -3881,7 +6442,8 @@ class SettingsTab(QWidget):
         self.pc_name.setPlaceholderText("예: 김민수PC")
         self.share_dir = QLineEdit()
         self.share_dir.setPlaceholderText("예: G:\\내 드라이브\\폰정책공유   또는   \\\\사장님PC\\폰정책공유")
-        sg.addWidget(QLabel("이 PC 역할"), 0, 0)
+        self.role_lbl = QLabel("이 PC 역할")
+        sg.addWidget(self.role_lbl, 0, 0)
         sg.addWidget(self.role, 0, 1)
         sg.addWidget(QLabel("이 PC 이름"), 0, 2)
         sg.addWidget(self.pc_name, 0, 3)
@@ -3904,6 +6466,32 @@ class SettingsTab(QWidget):
         lay.addWidget(sbox)
         self.main = None    # MainWindow가 연결
 
+        kbox = QGroupBox("⏰ 유지기간 기본값 · 💾 자동 백업")
+        kg = QGridLayout(kbox)
+        self.k_add, self.k_plan, self.k_line = QSpinBox(), QSpinBox(), QSpinBox()
+        for w in (self.k_add, self.k_plan, self.k_line):
+            w.setRange(1, 1000)
+            w.setSuffix(" 일")
+        self.bk_dir = QLineEdit()
+        self.bk_dir.setPlaceholderText("예: G:\\내 드라이브\\폰정책백업  (비우면 이 PC에만 백업)")
+        self.bk_lbl = QLabel("")
+        kg.addWidget(QLabel("부가서비스 유지"), 0, 0)
+        kg.addWidget(self.k_add, 0, 1)
+        kg.addWidget(QLabel("요금제 유지"), 0, 2)
+        kg.addWidget(self.k_plan, 0, 3)
+        kg.addWidget(QLabel("회선 유지(해지 환수)"), 0, 4)
+        kg.addWidget(self.k_line, 0, 5)
+        kg.addWidget(QLabel("백업 폴더(구글 드라이브 추천)"), 1, 0)
+        kg.addWidget(self.bk_dir, 1, 1, 1, 4)
+        kg.addWidget(btn("폴더 선택", lambda: self.bk_dir.setText(
+            os.path.normpath(QFileDialog.getExistingDirectory(self, "백업 폴더") or self.bk_dir.text()))), 1, 5)
+        kg.addWidget(btn("💾 저장", self.save_keep, primary=True), 2, 1)
+        kg.addWidget(btn("지금 백업하기", self.backup_now), 2, 2)
+        kg.addWidget(self.bk_lbl, 2, 3, 1, 3)
+        kg.addWidget(hint("대리점 규칙에 '93일' 같은 날짜가 있으면 그걸 우선 쓰고, 없으면 이 기본값을 씁니다. "
+                          "데이터는 하루 한 번 자동 백업(최근 30일치)되고, 백업 폴더를 정하면 거기에도 복사됩니다."), 3, 0, 1, 6)
+        lay.addWidget(kbox)
+
         dbox = QGroupBox("데이터 보관")
         dl = QHBoxLayout(dbox)
         lb = QLabel(f"저장 위치: {db.path}")
@@ -3915,10 +6503,12 @@ class SettingsTab(QWidget):
                          tip="새로 받은 phone_policy_manager.py 파일을 골라서 이 PC 프로그램을 업데이트합니다."))
         if not FROZEN:
             pass
-        dl.addWidget(btn("💿 설치 bat 만들기 (바로)", self.build_installer))
+        self.b_bat = btn("💿 직원용 설치 bat 만들기 (바로)", self.build_installer)
+        dl.addWidget(self.b_bat)
         if not FROZEN:
-            dl.addWidget(btn("🧙 설치 마법사 Setup.exe 만들기", self.build_setup_exe, primary=True,
-                             tip="카카오톡처럼 다음→설치→마침 화면이 뜨는 Setup.exe를 만듭니다 (약 10분)"))
+            self.b_setup = btn("🧙 직원용 Setup.exe 만들기", self.build_setup_exe, primary=True,
+                               tip="카카오톡처럼 다음→설치→마침 화면이 뜨는 Setup.exe를 만듭니다 (약 10분)")
+            dl.addWidget(self.b_setup)
         lay.addWidget(dbox)
 
     def refresh(self):
@@ -3926,6 +6516,11 @@ class SettingsTab(QWidget):
         self.margin.setValue(to_int(self.db.get("target_margin", "100000")))
         self.unit.setCurrentIndex(max(0, self.unit.findData(to_int(self.db.get("round_unit", "10000")))))
         self.api_key.setText(self.db.get("api_key", ""))
+        self.k_add.setValue(to_int(self.db.get("keep_addon_days", "93")) or 93)
+        self.k_plan.setValue(to_int(self.db.get("keep_plan_days", "93")) or 93)
+        self.k_line.setValue(to_int(self.db.get("keep_line_days", "183")) or 183)
+        self.bk_dir.setText(self.db.get("backup_dir", ""))
+        self.bk_lbl.setText(f"마지막 백업: {self.db.get('last_backup', '아직 없음')}")
         self.gh_repo.setText(gh_repo(self.db))
         self.gh_token.setText(self.db.get("gh_token", ""))
         self.b_gh_pub.setVisible(not self.db.is_staff_pc())
@@ -3964,6 +6559,8 @@ class SettingsTab(QWidget):
             return warn(self, "저장소는 'GitHub아이디/저장소이름' 모양으로 넣어주세요.\n예: yeogida/phone-policy")
         self.db.set("gh_repo", repo)
         self.db.set("gh_token", self.gh_token.text().strip())
+        if self.gh_token.text().strip():
+            self.db.set("role", "관리자")
         if not repo:
             return info(self, "인터넷 업데이트를 끕니다.")
         tok = self.gh_token.text().strip()
@@ -4017,6 +6614,26 @@ class SettingsTab(QWidget):
         if self.main:
             self.main.github_check(loud=True)
 
+    def save_keep(self):
+        self.db.set("keep_addon_days", self.k_add.value())
+        self.db.set("keep_plan_days", self.k_plan.value())
+        self.db.set("keep_line_days", self.k_line.value())
+        d = self.bk_dir.text().strip()
+        if d and not os.path.isdir(d):
+            return warn(self, "백업 폴더를 찾을 수 없습니다.")
+        self.db.set("backup_dir", d)
+        info(self, "저장했습니다.")
+
+    def backup_now(self):
+        self.save_keep() if False else None
+        self.db.set("backup_dir", self.bk_dir.text().strip())
+        try:
+            p = auto_backup(self.db, force=True)
+        except Exception as ex:
+            return warn(self, f"백업 실패: {ex}")
+        self.bk_lbl.setText(f"마지막 백업: {self.db.get('last_backup', '')}")
+        info(self, f"✅ 백업했습니다.\n{p}" + (f"\n+ {self.bk_dir.text()}" if self.bk_dir.text().strip() else ""))
+
     def pick_share(self):
         d = QFileDialog.getExistingDirectory(self, "공유 폴더 선택", self.share_dir.text() or BASE_DIR)
         if d:
@@ -4029,7 +6646,8 @@ class SettingsTab(QWidget):
         if d and os.path.normcase(os.path.abspath(d)) == os.path.normcase(BASE_DIR):
             return warn(self, "공유 폴더는 프로그램이 있는 폴더와 다른 폴더여야 합니다.\n"
                               "(프로그램과 데이터는 각 PC 바탕화면 폴더에 두고, 공유 폴더는 따로 만드세요)")
-        self.db.set("role", self.role.currentData())
+        if not self.db.is_staff_pc():
+            self.db.set("role", self.role.currentData())
         self.db.set("pc_name", self.pc_name.text().strip())
         self.db.set("share_dir", d)
         self._role_ui()
@@ -4054,9 +6672,35 @@ class SettingsTab(QWidget):
         if self.main:
             self.main.share_sync(startup=True, loud=True)
 
+    def become_owner(self):
+        """직원 PC → 사장님 PC 전환: GitHub 토큰을 아는 사람(사장님)만 가능"""
+        tok, ok = QInputDialog.getText(self, "사장님 PC로 전환", "사장님 PC로 바꾸려면 GitHub 토큰(github_pat_…)을 넣어주세요.",
+                                       QLineEdit.EchoMode.Password)
+        if not ok or not tok.strip():
+            return
+        repo = gh_repo(self.db)
+        try:
+            d = _gh(f"{GH_API}/repos/{repo}", tok.strip())
+            if not (d.get("permissions") or {}).get("push"):
+                raise RuntimeError("권한 없음")
+        except Exception:
+            return warn(self, "토큰이 맞지 않습니다. 사장님만 전환할 수 있습니다.")
+        self.db.set("role", "관리자")
+        self.db.set("gh_token", tok.strip())
+        self.refresh()
+        info(self, "사장님 PC로 전환했습니다.")
+
     def _role_ui(self):
         staff = self.db.is_staff_pc()
         self.b_publish.setVisible(not staff)
+        self.gbox.setVisible(not staff)
+        self.staff_box.setVisible(staff)
+        self.staff_upd_lbl.setText(f"사장님이 새 버전을 올리면 자동으로 '업데이트할까요?' 창이 뜹니다.   "
+                                   f"지금 버전: {APP_VERSION}")
+        self.role.setVisible(not staff)
+        self.role_lbl.setVisible(not staff)
+        for x in self.ag_btns + [self.b_bat] + ([self.b_setup] if hasattr(self, "b_setup") else []):
+            x.setVisible(not staff)
         self.ver_lbl.setText(f"이 PC 프로그램 버전: {APP_VERSION}")
 
     def save_settings(self):
@@ -4224,7 +6868,12 @@ GUIDE_HTML = """
 
 <h2>0. 한눈에 보기 — 매일 하는 일은 딱 3개</h2>
 <table>
-<tr><td>🌅 대리점 정책이 오면</td><td><b>📋 정책 입력</b> 탭 → 파일 올리고 → [AI로 읽기] → [저장]</td></tr>
+<tr><td>🌅 대리점 정책이 오면</td><td><b>📥 정책 일괄 등록</b> → 9곳 파일 전부 끌어다 놓기 → 대리점 확인 → [🤖 전부 읽고 저장]</td></tr>
+<tr><td>📣 우리 판매정책 만들기</td><td><b>📣 판매정책</b> → 요금 구간·목표마진·부가 기준 → [판매정책 만들기] → [📤 직원용 엑셀] → 카톡 배포</td></tr>
+<tr><td>⭐ 켜자마자</td><td><b>⭐ 한눈에</b> → 즐겨찾기 모델의 SK·KT·LG 최고 금액 + 최근 정책 오른/내린 것</td></tr>
+<tr><td>📦 모델 정리</td><td><b>📦 모델 관리</b> → 옛날·재고 없는 모델 🙈숨김, 재고 수량, ⭐즐겨찾기 ([🧹 숨길 후보 자동 체크])</td></tr>
+<tr><td>🧾 손님 견적</td><td><b>🧾 견적서</b> → 모델·요금제 고르면 3사 할부원금·월 납부액 비교 → [🖼 카톡용 이미지]</td></tr>
+<tr><td>🔎 모델별 마진 보기</td><td><b>🔎 정책마진 조회</b> → 'S26' 검색 → SK·KT·LG 대리점 전부의 기본·부가다함·부가없이 금액과 부가 내역이 한 화면에</td></tr>
 <tr><td>🙋 손님이 오면</td><td><b>🏆 최적 대리점</b> 탭 → 모델·요금제·부가 체크 → [찾기] → 제일 많이 주는 곳 확인</td></tr>
 <tr><td>📱 손님 개통하면</td><td><b>📱 개통 등록</b> 탭 → 한 건 입력 → [등록]</td></tr>
 <tr><td>💵 대리점 돈 들어오면</td><td><b>🧾 정산 대조</b> 탭 → 들어온 건 선택 → [입금처리]</td></tr>
@@ -4316,6 +6965,14 @@ GUIDE_HTML = """
 <li><b>[이 조건으로 개통 등록]</b>을 누르면 개통 등록 화면에 다 채워져서 넘어갑니다. 고객명만 넣고 [등록].</li>
 </ol>
 <p class='box'>💡 체크를 바꾸면 순위가 바로 다시 계산됩니다. "부가 안 하면 어디가 1등?" 같은 것도 바로 확인 가능.</p>
+
+<h2>6-1. 📶 요금제 구간별 비교</h2>
+<ul>
+<li>모델과 가입유형을 고르면 <b>115 · 105 · 95 · 85 · 75 · 69 · 61 · 55 · 44 · 33 요금</b>마다 대리점별 실제 받는 돈이 한 표로 나옵니다.</li>
+<li>SKT·KT·LG 요금제 이름이 달라도 <b>월 요금 기준</b>으로 맞춰서 비교합니다. 맨 아래 굵은 줄 = 통신사별 최고 금액.</li>
+<li>초록 칸 = 그 요금 구간 1등. 칸에 마우스를 올리면 적용된 요금제 구간과 부가·차감 조건이 보입니다.</li>
+<li>'요금(천원)' 칸이 <b>자동</b>이면 SK·KT·LG 정책표에 있는 요금 구간을 모아서 칸을 만듭니다. 직접 정하려면 115,95,69 처럼 적기.</li>
+</ul>
 
 <h2>6-2. 판매가 보기 / 가격표 뽑기</h2>
 <ul>
@@ -4739,7 +7396,7 @@ def first_run_setup(db):
     has_data = db.one("SELECT (SELECT COUNT(*) FROM policies) + (SELECT COUNT(*) FROM sales) AS n")["n"] > 0
     if d.get("share_dir") and not db.get("share_dir", ""):
         db.set("share_dir", d["share_dir"])
-    if d.get("share_dir") and not db.get("role", ""):
+    if d.get("share_dir") and not db.get("role", "") and DEFAULT_ROLE != "직원":
         box = QMessageBox()
         box.setWindowTitle(APP_NAME)
         box.setText("이 컴퓨터는 누가 쓰나요?")
@@ -5972,8 +8629,16 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.tabs)
         self.pages = [
             ("❓ 사용법", GuideTab(db)),
-            ("📋 정책 입력", PolicyEditTab(db)),
+            ("⭐ 한눈에", DashboardTab(db)),
+            ("⏰ 알림", AlertTab(db)),
+            ("🔎 정책마진 조회", MarginTab(db)),
+            ("📥 정책 일괄 등록", BatchTab(db)),
+            ("📣 판매정책", StorePolicyTab(db)),
+            ("🧾 견적서", QuoteTab(db)),
+            ("📦 모델 관리", ModelsTab(db)),
+            ("📋 정책 입력(개별)", PolicyEditTab(db)),
             ("🏆 최적 대리점", BestTab(db)),
+            ("📶 구간별 비교", TierTab(db)),
             ("💰 판매가·가격표", PriceTab(db)),
             ("⚖ 대리점 비교", CompareTab(db)),
             ("🕘 정책 이력", HistoryTab(db)),
@@ -5998,6 +8663,7 @@ class MainWindow(QMainWindow):
         if not quiet:
             self.sync_timer.start(10 * 60 * 1000)
             QTimer.singleShot(1500, lambda: self.share_sync(startup=True))
+            QTimer.singleShot(4000, self.daily_jobs)
         self.tabs.currentChanged.connect(self.on_tab)
         first = db.get("first_run_done", "") != "1" and not quiet
         self.tabs.setCurrentIndex(0 if first else 1)
@@ -6005,6 +8671,31 @@ class MainWindow(QMainWindow):
         if first:
             db.set("first_run_done", "1")
             QTimer.singleShot(400, self.welcome)
+
+    def daily_jobs(self):
+        try:
+            auto_backup(self.db)
+        except Exception as ex:
+            self.statusBar().showMessage(f"자동 백업 실패: {ex}", 10000)
+        try:
+            at = dict(self.pages)["⏰ 알림"]
+            n_today, n_rev = at.refresh()
+            i = self.tabs.indexOf(at)
+            self.tabs.setTabText(i, f"⏰ 알림 ({n_today + n_rev})" if n_today + n_rev else "⏰ 알림")
+            if (n_today or n_rev) and self.db.get("alert_shown", "") != today():
+                self.db.set("alert_shown", today())
+                if ask(self, f"⏰ 오늘 챙길 손님이 있습니다.\n\n· 부가서비스 해지·요금제 변경 안내: {n_today}명\n"
+                             f"· 할부 만료 재방문 대상: {n_rev}명\n\n알림 화면을 열까요?"):
+                    self.tabs.setCurrentWidget(at)
+        except Exception:
+            pass
+
+    def closeEvent(self, e):
+        try:
+            auto_backup(self.db, force=True)
+        except Exception:
+            pass
+        super().closeEvent(e)
 
     def _title(self):
         role = "직원 PC" if self.db.is_staff_pc() else "사장님 PC"
@@ -6033,7 +8724,10 @@ class MainWindow(QMainWindow):
             v = json.loads(gh_get_file(repo, "version.json", timeout=8).decode("utf-8"))
         except Exception as ex:
             if loud:
-                warn(self, "새 버전 확인 실패\n\n" + gh_error(ex))
+                if isinstance(ex, urllib.error.HTTPError) and ex.code == 404:
+                    warn(self, "아직 배포된 버전이 없습니다.\n사장님 PC에서 [📤 직원들에게 업데이트 배포]를 먼저 눌러주세요.")
+                else:
+                    warn(self, "새 버전 확인 실패\n\n" + gh_error(ex))
             return False
         rv = str(v.get("version", ""))
         if not rv or ver_tuple(rv) <= ver_tuple(APP_VERSION):
